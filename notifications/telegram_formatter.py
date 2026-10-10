@@ -12,6 +12,7 @@ from notifications.telegram_keyboards import (
     InlineKeyboard,
     back_to_main_keyboard,
     cancel_keyboard,
+    check_result_keyboard,
     main_menu_keyboard,
     remove_confirmation_keyboard,
     status_keyboard,
@@ -128,6 +129,7 @@ def format_help() -> FormattedMessage:
         "📋 <b>/wallets</b> — izlenen cüzdanları listele\n",
         "🗑️ <b>/unwatch &lt;ağ&gt; &lt;adres&gt;</b> — cüzdanı kaldır\n",
         "🕘 <b>/history &lt;ağ&gt; &lt;adres&gt;</b> — son 10 ERC-20 transferini göster\n",
+        "🔍 <b>/check [ağ] &lt;değer&gt;</b> — token ya da işlem kontrol et\n",
         "📊 <b>/status</b> — izleme durumunu göster",
     ]
     return FormattedMessage(
@@ -441,3 +443,159 @@ def format_api_status(status: str) -> FormattedMessage:
         raise ValueError(f"Desteklenmeyen API durumu: {status}")
     title, body = messages[status]
     return FormattedMessage(_with_separator(title, body))
+
+
+def format_check_usage() -> FormattedMessage:
+    return FormattedMessage(
+        _with_separator(
+            "🔍 <b>Token ya da işlem kontrol et</b>",
+            "Bir token kontratı veya işlem hash'i gönder. Ağ belirtilmezse Ethereum kullanılır.\n\n"
+            "Örnekler:\n<code>/check 0x0000000000000000000000000000000000000000</code>\n"
+            "<code>/check ethereum 0x0000000000000000000000000000000000000000000000000000000000000000</code>",
+        ),
+        reply_markup=back_to_main_keyboard(),
+    )
+
+
+def format_check_prompt() -> FormattedMessage:
+    return FormattedMessage(
+        _with_separator(
+            "🔍 <b>Kontrol Et</b>",
+            "Token kontratı ya da işlem hash'i gönder.\n⏳ Bu istek 5 dakika geçerlidir.",
+        ),
+        reply_markup=cancel_keyboard(),
+    )
+
+
+def format_check_error(kind: str = "provider") -> FormattedMessage:
+    messages = {
+        "not_found": "İşlem bulunamadı. Henüz ağa gönderilmemiş ya da ağ yanlış olabilir.",
+        "rate_limit": "⏳ Etherscan istek sınırına ulaşıldı. Biraz sonra yeniden dene.",
+        "provider": "Blokzincir sağlayıcısından yanıt alınamadı. Biraz sonra yeniden dene.",
+        "too_fast": "⏳ Çok hızlı; birkaç saniye bekle.",
+        "expired": "Kontrol isteğinin süresi doldu. Yeniden başlamak için /check yaz.",
+    }
+    return FormattedMessage(
+        _with_separator("⚠️ <b>Kontrol tamamlanamadı</b>", messages.get(kind, messages["provider"])),
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+def format_token_check(result) -> FormattedMessage:
+    if result.is_wallet:
+        return FormattedMessage(
+            _with_separator(
+                "👛 <b>Cüzdan adresi</b>",
+                "Bu bir cüzdan adresi, token kontratı değil. /watch ile izleyebilir veya /history ile geçmişine bakabilirsin.\n\n"
+                f"📄 Adres: <code>{escape(result.token_address)}</code>",
+            ),
+            reply_markup=check_result_keyboard(result.network, result.token_address, token=True, wallet=True),
+        )
+    analysis = result.analysis
+    classification = analysis.classification if analysis is not None else "UNKNOWN"
+    severity, label = CLASSIFICATION_STYLE.get(classification, CLASSIFICATION_STYLE["UNKNOWN"])
+    info = result.contract_info
+    symbol = sanitize_token_text(info.symbol or "Bilinmiyor")
+    name = sanitize_token_text(info.name or "").replace("\n", " ")
+    rows = [
+        f"{severity} <b>Token Kontrolü · {escape(label)}</b>",
+        SEPARATOR,
+        f"🌐 Ağ: {escape(result.network.capitalize())}",
+        f"🪙 Token: <code>{escape(symbol)}</code>" + (f" ({escape(name)})" if name else ""),
+        f"📄 Token kontratı: <code>{escape(result.token_address)}</code>",
+        f"🛡️ Sınıflandırma: <b>{escape(label)}</b>",
+    ]
+    if classification in {"VARIANT", "KNOWN_FRAUD"}:
+        rows.append(f"⚠️ {escape(FRAUD_WARNING)}")
+    if analysis and analysis.details:
+        detail = sanitize_token_text(analysis.details, 500).replace("\n", " ")
+        rows.append(f"ℹ️ Ayrıntı: {escape(detail)}")
+    return FormattedMessage(
+        _fit_check_text("\n".join(rows)),
+        reply_markup=check_result_keyboard(
+            result.network, result.token_address, token=True, suspicious=classification in {"VARIANT", "KNOWN_FRAUD"}
+        ),
+    )
+
+
+def format_tx_check(result) -> FormattedMessage:
+    from notifications.telegram_keyboards import url_button
+    from networks import get_network_config
+
+    if result.transaction is None:
+        return format_check_error("not_found")
+    config = get_network_config(result.network)
+    classification = result.classification
+    severity, label = CLASSIFICATION_STYLE.get(classification, CLASSIFICATION_STYLE["UNKNOWN"])
+    if not result.transfers:
+        label = "Token transferi yok"
+    transaction = result.transaction
+    status = {"success": "✅ Başarılı", "failed": "❌ Başarısız", "pending": "⏳ Beklemede"}.get(transaction.status, "⏳ Beklemede")
+    rows = [
+        f"{severity} <b>İşlem Kontrolü · {escape(label)}</b>",
+        SEPARATOR,
+        f"🌐 Ağ: {escape(result.network.capitalize())}",
+        f"🔗 TXID: <code>{escape(result.tx_hash)}</code>",
+        status,
+    ]
+    if transaction.block_time:
+        moment = transaction.block_time.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        rows.append(f"🕒 {escape(moment)}")
+    if transaction.block_number is not None:
+        block_row = f"🧱 Blok: {transaction.block_number:,}"
+        if transaction.confirmations is not None:
+            block_row += f" · Onay: {transaction.confirmations:,}"
+        rows.append(block_row)
+    suspicious_address = next(
+        (
+            item.transfer.token_address
+            for item in result.transfers
+            if item.analysis.classification in {"VARIANT", "KNOWN_FRAUD"}
+        ),
+        None,
+    )
+    if not result.transfers:
+        rows.append("ℹ️ Bu işlemde ERC-20 token transferi bulunamadı.")
+    visible = list(result.transfers[:5])
+    for index, item in enumerate(visible, 1):
+        transfer = item.transfer
+        style, item_label = CLASSIFICATION_STYLE.get(item.analysis.classification, CLASSIFICATION_STYLE["UNKNOWN"])
+        symbol = sanitize_token_text(transfer.token_symbol)
+        rows.extend([
+            SEPARATOR,
+            f"{style} <b>Token transferi {index} · {escape(item_label)}</b>",
+            f"🪙 Miktar: <b>{escape(format_token_amount(transfer.amount))} <code>{escape(symbol)}</code></b>",
+            f"🛡️ Sınıflandırma: <b>{escape(item_label)}</b>",
+            f"📤 Gönderen: <code>{escape(transfer.sender)}</code>",
+            f"📥 Alıcı: <code>{escape(transfer.receiver)}</code>",
+            f"📄 Token kontratı: <code>{escape(transfer.token_address)}</code>",
+        ])
+    if len(result.transfers) > len(visible):
+        rows.append(f"+{len(result.transfers) - len(visible)} transfer daha")
+    buttons = [[url_button("🔍 İşlemi Aç", config.transaction_url(result.tx_hash))]]
+    if suspicious_address:
+        buttons[0].append(url_button("📄 Kontratı Aç", config.token_url(suspicious_address)))
+    text = _fit_check_text("\n".join(rows))
+    if len(text.encode("utf-16-le")) // 2 > MAX_TELEGRAM_TEXT_UNITS:
+        text = _fit_check_text("\n".join(rows[:6] + ["ℹ️ Ayrıntılar kısaltıldı."]))
+    return FormattedMessage(text, reply_markup={"inline_keyboard": buttons})
+
+
+def _fit_check_text(text: str) -> str:
+    if _utf16_units(text) <= MAX_TELEGRAM_TEXT_UNITS:
+        return text
+    # Only truncate plain text after escaping so HTML tags remain balanced.
+    suffix = "…"
+    budget = MAX_TELEGRAM_TEXT_UNITS - _utf16_units(suffix)
+    output = []
+    used = 0
+    for char in text:
+        units = _utf16_units(char)
+        if used + units > budget:
+            break
+        output.append(char)
+        used += units
+    clipped = "".join(output)
+    # Back off to a complete line if truncation landed inside HTML markup.
+    clipped = clipped.rsplit("\n", 1)[0] if "\n" in clipped else ""
+    return clipped + suffix

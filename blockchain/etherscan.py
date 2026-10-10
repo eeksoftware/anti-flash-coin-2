@@ -93,6 +93,8 @@ class EtherscanClient(BlockchainClient):
         if detail and detail.lower() != message.lower():
             message = f"{message}: {detail}"
         prefix = "Etherscan RPC hatası" if rpc else "Etherscan API hatası"
+        if "rate limit" in message.lower() or "max calls per sec" in message.lower():
+            raise EtherscanRateLimitError(f"{prefix}: {message}")
         raise EtherscanError(f"{prefix}: {message}")
 
     async def get_token_transfers(
@@ -177,6 +179,7 @@ class EtherscanClient(BlockchainClient):
             "action": "getsourcecode",
             "address": address,
         })
+        self._raise_rate_limit(data)
         result = data.get("result")
         if isinstance(result, list) and result and isinstance(result[0], dict):
             return result[0]
@@ -189,10 +192,18 @@ class EtherscanClient(BlockchainClient):
             "action": "getcontractcreation",
             "contractaddresses": address,
         })
+        self._raise_rate_limit(data)
         result = data.get("result")
         if isinstance(result, list) and result and isinstance(result[0], dict):
             return result[0]
         return None
+
+    @staticmethod
+    def _raise_rate_limit(data: dict[str, Any]) -> None:
+        detail = data.get("result")
+        message = f"{data.get('message', '')} {detail if isinstance(detail, str) else ''}".lower()
+        if "rate limit" in message or "max calls per sec" in message:
+            raise EtherscanRateLimitError("Etherscan istek sınırına ulaşıldı.")
 
 
 def _hex_int(value: Any, field_name: str) -> int:

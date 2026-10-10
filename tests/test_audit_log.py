@@ -9,6 +9,7 @@ import pytest
 
 from audit_log import (
     SecretRedactionFilter,
+    _transaction_payload,
     configure_logging,
     flush_logging,
     log_transaction,
@@ -89,7 +90,7 @@ def test_transaction_rows_are_valid_json_and_include_required_fields(isolated_lo
     assert len(rows) == 1
     record = json.loads(rows[0])
     required = {
-        "ts", "run_id", "source", "network", "tx_hash", "block_number",
+        "ts", "run_id", "bot_version", "source", "network", "tx_hash", "block_number",
         "block_time", "direction", "wallet", "sender", "receiver",
         "token_address", "token_symbol", "amount", "classification",
         "classification_label", "signals", "notified", "telegram_message_id",
@@ -98,6 +99,37 @@ def test_transaction_rows_are_valid_json_and_include_required_fields(isolated_lo
     assert required <= record.keys()
     assert record["amount"] == "1000.00"
     assert record["ts"].endswith("Z")
+
+
+def test_manual_address_checks_keep_null_tx_hash_and_do_not_enter_detections(isolated_logs):
+    log_transaction(transaction_record(
+        source="manual",
+        tx_hash=None,
+        event_key="manual:token-check-1",
+        classification="UNKNOWN",
+        is_wallet=True,
+    ))
+    log_transaction(transaction_record(
+        source="manual",
+        tx_hash=TX_HASH,
+        event_key="manual:transaction-check-1",
+        classification="UNKNOWN",
+        no_token_transfers=True,
+    ))
+    flush_logging()
+
+    records = [json.loads(line) for line in read_lines(isolated_logs / "transactions.log")]
+    assert len(records) == 2
+    assert records[0]["tx_hash"] is None
+    assert all("bot_version" in record for record in records)
+    detection_path = isolated_logs / "detections.log"
+    assert not detection_path.exists() or not read_lines(detection_path)
+
+
+def test_transaction_payload_does_not_coerce_null_hash_to_text():
+    payload = _transaction_payload(transaction_record(tx_hash=None))
+    assert payload["tx_hash"] is None
+    assert isinstance(payload["bot_version"], str) and payload["bot_version"]
 
 
 def test_secret_filter_masks_api_key_and_telegram_token_in_message_and_traceback():

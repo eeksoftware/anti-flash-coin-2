@@ -23,6 +23,7 @@ from audit_log import (
     flush_logging,
     get_run_id,
     log_transaction,
+    set_bot_version,
     shutdown_logging,
     take_interval_counts,
 )
@@ -40,6 +41,7 @@ from notifications.telegram import (
     TelegramNotifier,
 )
 from providers.ethereum import EthereumProvider
+from services.check_service import CheckService
 from version import get_git_commit, get_version
 
 
@@ -51,9 +53,11 @@ async def main() -> None:
     )
     logger = logging.getLogger(__name__)
     started_at = time.monotonic()
+    bot_version = get_version()
+    set_bot_version(bot_version)
     logger.info(
         "Bot başlatıldı | sürüm=%s | git_commit=%s | run_id=%s",
-        get_version(),
+        bot_version,
         get_git_commit(),
         get_run_id(),
     )
@@ -77,6 +81,7 @@ async def main() -> None:
         provider = EthereumProvider(client)
         price_client = DexScreenerPriceClient()
         token_analyzer = TokenAnalyzer()
+        check_service = CheckService({"ethereum": provider}, token_analyzer)
         telegram = None
         if settings.telegram_bot_token:
             telegram = TelegramNotifier(
@@ -191,9 +196,9 @@ async def main() -> None:
                 })
                 observed, errors = take_interval_counts()
                 logger.info(
-                "Heartbeat | bot_version=%s | run_id=%s | izlenen_cuzdan=%d | gozlenen_transfer=%d | hata=%d | uptime_s=%.0f",
-                get_version(),
-                get_run_id(),
+                    "Heartbeat | bot_version=%s | run_id=%s | izlenen_cuzdan=%d | gozlenen_transfer=%d | hata=%d | uptime_s=%.0f",
+                    bot_version,
+                    get_run_id(),
                     wallet_count,
                     observed,
                     errors,
@@ -217,6 +222,7 @@ async def main() -> None:
                 notifier=telegram,
                 wallet_store=wallet_store,
                 price_client=price_client,
+                check_service=check_service,
             )
             if telegram is not None
             else None

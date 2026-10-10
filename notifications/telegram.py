@@ -8,13 +8,20 @@ import aiohttp
 
 from analyzer.token_analyzer import TokenAnalysis
 from blockchain.token_price import DexScreenerPriceClient
+from blockchain.etherscan import EtherscanError, EtherscanRateLimitError, EtherscanTimeoutError
 from models.transaction import TokenTransfer
 from networks import get_network_config
+from services.check_input import InvalidCheckInput, parse_check_args
+from services.check_limits import CheckRateLimiter
+from services.check_service import CheckService
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore, WalletSubscription
 from notifications.telegram_formatter import (
     FormattedMessage,
     format_about,
+    format_check_error,
+    format_check_prompt,
+    format_check_usage,
     format_add_expired,
     format_add_invalid,
     format_add_network,
@@ -31,6 +38,8 @@ from notifications.telegram_formatter import (
     format_stale_menu,
     format_start,
     format_status,
+    format_token_check,
+    format_tx_check,
     format_transfer_alert,
     format_wallet_list,
     format_watch_result,
@@ -38,6 +47,7 @@ from notifications.telegram_formatter import (
 from notifications.telegram_keyboards import (
     MENU_ABOUT,
     MENU_ADD,
+    MENU_CHECK,
     MENU_HELP,
     MENU_HISTORY,
     MENU_MAIN,
@@ -68,6 +78,13 @@ class TelegramError(Exception):
 @dataclass(frozen=True)
 class PendingAddress:
     network: str
+    chat_id: str
+    message_id: int
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class PendingCheck:
     chat_id: str
     message_id: int
     expires_at: float
@@ -215,17 +232,21 @@ class TelegramBotController:
         notifier: TelegramNotifier,
         wallet_store: WalletStateStore,
         price_client: DexScreenerPriceClient,
+        check_service: CheckService | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.monitor = monitor
         self.notifier = notifier
         self.wallet_store = wallet_store
         self.price_client = price_client
+        self.check_service = check_service
         self.session: aiohttp.ClientSession | None = None
         self._offset: int | None = None
         self.bot_name = "Anti-Flash Token Bot"
         self.bot_username: str | None = None
         self._pending_addresses: dict[str, PendingAddress] = {}
+        self._pending_checks: dict[str, PendingCheck] = {}
+        self._check_rate_limiter = CheckRateLimiter()
 
     async def run(self) -> None:
         self.session = aiohttp.ClientSession(
@@ -263,6 +284,7 @@ class TelegramBotController:
             {"command": "watch", "description": "İzlenecek cüzdan ekle"},
             {"command": "unwatch", "description": "İzlenen cüzdanı kaldır"},
             {"command": "history", "description": "Son token transferlerini göster"},
+            {"command": "check", "description": "Token ya da işlem kontrol et"},
             {"command": "status", "description": "İzleme durumunu göster"},
             {"command": "help", "description": "Yardım menüsünü aç"},
         ]
@@ -353,6 +375,7 @@ class TelegramBotController:
 
         if command == "/start":
             self._pending_addresses.pop(user_id, None)
+            self._pending_checks.pop(user_id, None)
             await self._send(
                 chat_id,
                 format_start(
@@ -365,6 +388,19 @@ class TelegramBotController:
         if command == "/help":
             await self._send(chat_id, format_help())
             return
+
+        pending_check = self._pending_checks.get(user_id)
+        if pending_check is not None and not command.startswith("/"):
+            if time.monotonic() >= pending_check.expires_at:
+                self._pending_checks.pop(user_id, None)
+                await self._edit(pending_check.chat_id, pending_check.message_id, format_check_error("expired"))
+                return
+            self._pending_checks.pop(user_id, None)
+            await self._handle_check([text.strip()], user_id, chat_id, pending_check.message_id)
+            return
+        if pending_check is not None and time.monotonic() >= pending_check.expires_at:
+            self._pending_checks.pop(user_id, None)
+            await self._edit(pending_check.chat_id, pending_check.message_id, format_check_error("expired"))
 
         pending = self._pending_addresses.get(user_id)
         if pending is not None and not command.startswith("/"):
@@ -384,6 +420,8 @@ class TelegramBotController:
             await self._handle_unwatch_command(parts, user_id, chat_id)
         elif command == "/history":
             await self._handle_history_command(parts, chat_id)
+        elif command == "/check":
+            await self._handle_check(parts[1:], user_id, chat_id)
         else:
             logger.info("Bilinmeyen Telegram komutu yok sayıldı.")
 
@@ -452,6 +490,44 @@ class TelegramBotController:
             return
         await self._show_history(chat_id, parts[1].lower(), parts[2].lower())
 
+    async def _handle_check(
+        self,
+        args: list[str],
+        user_id: str,
+        chat_id: str,
+        edit_message_id: int | None = None,
+    ) -> None:
+        try:
+            request = parse_check_args(args)
+        except InvalidCheckInput:
+            await self._show_formatted(chat_id, format_check_usage(), edit_message_id)
+            return
+        except ValueError:
+            await self._show_formatted(chat_id, format_check_usage(), edit_message_id)
+            return
+        if self.check_service is None:
+            await self._show_formatted(chat_id, format_check_error("provider"), edit_message_id)
+            return
+        if not self._check_rate_limiter.allow(user_id):
+            await self._show_formatted(chat_id, format_check_error("too_fast"), edit_message_id)
+            return
+        try:
+            if request.kind == "token":
+                result = await self.check_service.check_token(request.network, request.value)
+                message = format_token_check(result)
+            else:
+                result = await self.check_service.check_transaction(request.network, request.value)
+                message = format_tx_check(result)
+        except EtherscanRateLimitError:
+            message = format_check_error("rate_limit")
+        except (EtherscanTimeoutError, EtherscanError):
+            logger.warning("Manuel kontrol sağlayıcı hatası: %s", "API_ERROR")
+            message = format_check_error("provider")
+        except Exception as exc:
+            logger.warning("Manuel kontrol tamamlanamadı: %s", type(exc).__name__)
+            message = format_check_error("provider")
+        await self._show_formatted(chat_id, message, edit_message_id)
+
     async def _handle_callback_query(self, callback: dict[str, Any]) -> None:
         callback_id = callback.get("id")
         if not isinstance(callback_id, str):
@@ -511,6 +587,12 @@ class TelegramBotController:
             await self._edit(chat_id, message_id, format_wallet_list(wallets))
         elif data == MENU_ADD:
             await self._edit(chat_id, message_id, format_add_network())
+        elif data == MENU_CHECK:
+            self._pending_addresses.pop(user_id, None)
+            self._pending_checks[user_id] = PendingCheck(
+                chat_id, message_id, time.monotonic() + self.PENDING_ADDRESS_TTL
+            )
+            await self._edit(chat_id, message_id, format_check_prompt())
         elif data == MENU_HISTORY:
             if not wallets:
                 await self._edit(chat_id, message_id, format_wallet_list(wallets))
@@ -540,6 +622,7 @@ class TelegramBotController:
             await self._edit(chat_id, message_id, format_add_prompt(network))
         elif data == WALLET_CANCEL:
             self._pending_addresses.pop(user_id, None)
+            self._pending_checks.pop(user_id, None)
             await self._edit(chat_id, message_id, format_start(
                 self.bot_name,
                 str(sender.get("first_name") or "kullanıcı"),

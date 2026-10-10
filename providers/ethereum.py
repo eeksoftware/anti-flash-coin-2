@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from blockchain.etherscan import EtherscanClient
+from blockchain.etherscan import EtherscanClient, EtherscanRateLimitError, EtherscanTimeoutError
 from blockchain.normalizer import normalize_etherscan_transfers
 from models.transaction import TokenTransfer
 from networks import get_network_config
@@ -26,6 +26,7 @@ class EthereumProvider:
         self.config = get_network_config(self.network)
         self._metadata_cache: dict[str, tuple[float, ContractInfo]] = {}
         self._receipt_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
+        self._block_cache: dict[int, tuple[float, dict[str, Any] | None]] = {}
 
     async def close(self) -> None:
         await self.client.close()
@@ -59,7 +60,7 @@ class EthereumProvider:
         status_value = receipt.get("status")
         status = "success" if _hex_int(status_value) != 0 else "failed"
         latest_block = await self.client.get_block_number()
-        block = await self.client.get_block(block_number)
+        block = await self._get_block(block_number)
         timestamp = _hex_int(block.get("timestamp")) if block and block.get("timestamp") is not None else None
         block_time = datetime.fromtimestamp(timestamp, timezone.utc) if timestamp is not None else None
         return TransactionInfo(
@@ -80,7 +81,7 @@ class EthereumProvider:
         block_number = _hex_int(block_value) if block_value is not None else 0
         timestamp = datetime.now(timezone.utc)
         if block_number:
-            block = await self.client.get_block(block_number)
+            block = await self._get_block(block_number)
             if block and block.get("timestamp") is not None:
                 timestamp = datetime.fromtimestamp(_hex_int(block["timestamp"]), timezone.utc)
 
@@ -108,7 +109,7 @@ class EthereumProvider:
                 continue
             info = metadata.get(token_address)
             if info is None:
-                info = await self.get_contract_info(token_address)
+                info = await self._get_transfer_metadata(token_address)
                 metadata[token_address] = info
             decimals = info.decimals if info.decimals is not None else self.config.default_token_decimals
             output.append(TokenTransfer(
@@ -121,7 +122,7 @@ class EthereumProvider:
                 token_symbol=info.symbol or "UNKNOWN",
                 token_name=info.name or info.symbol or "Unknown token",
                 decimals=decimals,
-                amount=Decimal(raw_amount).scaleb(-decimals),
+                amount=Decimal(f"{raw_amount}e-{decimals}"),
                 sender=sender,
                 receiver=receiver,
                 direction="UNKNOWN",
@@ -157,6 +158,10 @@ class EthereumProvider:
             source = await self.client.get_contract_source(address)
             if source is not None:
                 verified = bool(source.get("SourceCode"))
+        except EtherscanRateLimitError:
+            raise
+        except EtherscanTimeoutError:
+            raise
         except Exception:
             pass
         try:
@@ -166,6 +171,10 @@ class EthereumProvider:
                 hash_value = creation.get("txHash")
                 creator = str(creator_value).lower() if creator_value else None
                 creation_tx = str(hash_value).lower() if hash_value else None
+        except EtherscanRateLimitError:
+            raise
+        except EtherscanTimeoutError:
+            raise
         except Exception:
             pass
         info = ContractInfo(True, name, symbol, decimals, verified, creator, creation_tx, created_at)
@@ -180,10 +189,33 @@ class EthereumProvider:
         self._receipt_cache[tx_hash.lower()] = (time.monotonic(), receipt)
         return receipt
 
+    async def _get_block(self, block_number: int) -> dict[str, Any] | None:
+        cached = self._block_cache.get(block_number)
+        if cached and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        block = await self.client.get_block(block_number)
+        self._block_cache[block_number] = (time.monotonic(), block)
+        return block
+
+    async def _get_transfer_metadata(self, address: str) -> ContractInfo:
+        """Fetch only symbol/decimals on receipt checks to keep calls near six."""
+        cached = self._metadata_cache.get(address)
+        if cached and time.monotonic() - cached[0] < _METADATA_TTL_SECONDS:
+            return cached[1]
+        symbol = await _optional_call(self.client, address, "0x95d89b41", _decode_abi_text)
+        decimals = await _optional_call(self.client, address, "0x313ce567", _decode_uint)
+        if decimals is not None and not 0 <= decimals <= 255:
+            decimals = None
+        return ContractInfo(True, symbol, symbol, decimals)
+
 
 async def _optional_call(client: EtherscanClient, address: str, selector: str, decoder):
     try:
         return decoder(await client.eth_call(address, selector))
+    except EtherscanRateLimitError:
+        raise
+    except EtherscanTimeoutError:
+        raise
     except Exception:
         return None
 

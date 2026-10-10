@@ -1,15 +1,10 @@
 from typing import Any
 from urllib.parse import quote
 
-from networks import get_network_config
+from networks import NETWORKS as NETWORK_CONFIGS, get_network_config
 
 
-NETWORKS = {
-    "ethereum": "🔷 Ethereum",
-}
-NETWORK_EXPLORERS = {
-    "ethereum": "https://etherscan.io",
-}
+NETWORKS = {name: f"🔷 {config.display_name}" for name, config in NETWORK_CONFIGS.items()}
 
 MENU_MAIN = "menu:main"
 MENU_WALLETS = "menu:wallets"
@@ -18,6 +13,7 @@ MENU_HISTORY = "menu:history"
 MENU_STATUS = "menu:status"
 MENU_HELP = "menu:help"
 MENU_ABOUT = "menu:about"
+MENU_CHECK = "menu:check"
 WALLET_ADD_PREFIX = "w:add:"
 WALLET_CANCEL = "w:cancel"
 WALLET_HISTORY_PREFIX = "w:h:"
@@ -47,6 +43,7 @@ def main_menu_keyboard() -> InlineKeyboard:
     return inline_keyboard([
         [callback_button("➕ Cüzdan Ekle", MENU_ADD), callback_button("📋 Cüzdanlarım", MENU_WALLETS)],
         [callback_button("🕘 Geçmiş", MENU_HISTORY), callback_button("📊 Durum", MENU_STATUS)],
+        [callback_button("🔍 Kontrol Et", MENU_CHECK)],
         [callback_button("❓ Yardım", MENU_HELP), callback_button("ℹ️ Hakkında", MENU_ABOUT)],
     ])
 
@@ -70,6 +67,24 @@ def add_network_keyboard() -> InlineKeyboard:
 
 def cancel_keyboard() -> InlineKeyboard:
     return inline_keyboard([[callback_button("❌ İptal", WALLET_CANCEL)]])
+
+
+def check_result_keyboard(
+    network: str,
+    value: str,
+    *,
+    token: bool = False,
+    suspicious: bool = False,
+    wallet: bool = False,
+) -> InlineKeyboard:
+    config = get_network_config(network)
+    rows = [[url_button("🔍 İşlemi Aç", config.transaction_url(quote(value, safe="")))]] if not token else []
+    if wallet:
+        rows.append([url_button("👛 Adresi Aç", config.address_url(quote(value, safe="")))])
+    elif token or suspicious:
+        rows.append([url_button("📄 Kontratı Aç", config.token_url(quote(value, safe="")))])
+    rows.append([callback_button("⬅️ Ana Menü", MENU_MAIN)])
+    return inline_keyboard(rows)
 
 
 def wallets_keyboard(wallets: list[Any], page: int = 0, page_size: int = 8) -> InlineKeyboard:

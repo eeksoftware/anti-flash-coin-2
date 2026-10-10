@@ -46,6 +46,7 @@ _run_id = uuid.uuid4().hex[:8]
 _observed_transactions = 0
 _error_count = 0
 _runtime: _LoggingRuntime | None = None
+_bot_version: str | None = None
 
 
 def _stderr_warning(message: str) -> None:
@@ -273,7 +274,11 @@ class _TransactionRouter(logging.Handler):
                 connection.execute("DELETE FROM seen WHERE event_key = ?", (key,))
                 connection.commit()
                 return
-            if data.get("classification") != SAFE_CLASSIFICATION:
+            if (
+                data.get("classification") != SAFE_CLASSIFICATION
+                and not data.get("is_wallet")
+                and not data.get("no_token_transfers")
+            ):
                 self.detections.emit(line)
             if data.get("source") == "monitor":
                 global _observed_transactions
@@ -340,7 +345,7 @@ def configure_logging(
     force: bool = False,
 ) -> str:
     """Start the asynchronous redacted file logger and return this run's ID."""
-    global _runtime, _run_id
+    global _runtime, _run_id, _bot_version
     with _runtime_lock:
         if _runtime is not None and not force:
             return _run_id
@@ -370,6 +375,7 @@ def configure_logging(
             log_level = logging._nameToLevel.get(level_name, logging.INFO)
 
         _run_id = uuid.uuid4().hex[:8]
+        _bot_version = get_version()
         queue_instance: queue.Queue[logging.LogRecord] = queue.Queue()
         queue_handler = logging.handlers.QueueHandler(queue_instance)
         queue_handler.setLevel(logging.DEBUG)
@@ -430,6 +436,12 @@ def configure_logging(
 
 def get_run_id() -> str:
     return _run_id
+
+
+def set_bot_version(version: str) -> None:
+    """Set the already-resolved build version used in all JSON audit rows."""
+    global _bot_version
+    _bot_version = _safe_text(version, 80)
 
 
 def flush_logging() -> None:
@@ -504,10 +516,14 @@ def _transaction_payload(record: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ts": _timestamp(record.get("ts")),
         "run_id": _safe_text(record.get("run_id", get_run_id()), 32),
-        "bot_version": _safe_text(record.get("bot_version", get_version()), 80),
+        "bot_version": _safe_text(record.get("bot_version", _bot_version or get_version()), 80),
         "source": _safe_text(record.get("source", "monitor"), 16),
         "network": _safe_text(record.get("network", ""), 32),
-        "tx_hash": _safe_text(record.get("tx_hash", ""), 160),
+        "tx_hash": (
+            _safe_text(record["tx_hash"], 160)
+            if record.get("tx_hash") is not None
+            else None
+        ),
         "log_index": record.get("log_index"),
         "event_key": (
             _safe_text(record["event_key"], 256)
@@ -537,6 +553,9 @@ def _transaction_payload(record: dict[str, Any]) -> dict[str, Any]:
         "expected": _safe_text(record["expected"], 16) if record.get("expected") else None,
         "note": _safe_text(record["note"], 500) if record.get("note") else None,
         "error": _safe_text(record["error"], 500) if record.get("error") else None,
+        "is_wallet": record.get("is_wallet") if isinstance(record.get("is_wallet"), bool) else None,
+        "cached": record.get("cached") if isinstance(record.get("cached"), bool) else None,
+        "no_token_transfers": record.get("no_token_transfers") if isinstance(record.get("no_token_transfers"), bool) else None,
     }
     return payload
 
@@ -558,7 +577,7 @@ def log_test_event(record: dict[str, Any]) -> bool:
         payload = {key: _safe_text(value, 2000) if isinstance(value, str) else value for key, value in record.items()}
         payload.setdefault("ts", _timestamp())
         payload.setdefault("run_id", get_run_id())
-        payload.setdefault("bot_version", get_version())
+        payload.setdefault("bot_version", _bot_version or get_version())
         logging.getLogger("audit.tests").info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return True
     except Exception:

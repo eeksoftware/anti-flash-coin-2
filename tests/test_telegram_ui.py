@@ -37,6 +37,7 @@ from notifications.telegram_formatter import (
     _time_row,
 )
 from notifications.telegram_keyboards import (
+    MENU_CHECK,
     MENU_MAIN,
     WALLET_HISTORY_PREFIX,
     WALLET_REMOVE_CONFIRM_PREFIX,
@@ -51,6 +52,8 @@ from notifications.telegram_keyboards import (
     status_keyboard,
     wallets_keyboard,
 )
+from providers.base import ContractInfo
+from services.check_service import TokenCheckResult
 
 
 WALLET_A = "0x" + "1" * 40
@@ -301,6 +304,13 @@ class FakeNotifier:
         self.sent = []
         self.edited = []
         self.answered = []
+        self.calls = []
+
+    async def call_api(self, method, payload=None):
+        self.calls.append((method, payload))
+        if method == "getMe":
+            return {"result": {"first_name": "Test Bot", "username": "test_bot"}}
+        return {"result": True}
 
     async def send_formatted(self, message, chat_id):
         self.sent.append((chat_id, message))
@@ -354,6 +364,71 @@ def test_unknown_callback_is_handled_as_stale_menu_without_error():
     asyncio.run(controller._handle_callback_query(callback))
     assert notifier.answered[0][0] == "query-1"
     assert notifier.edited[0][2].text.startswith("⚠️ <b>Bu menü eski</b>")
+
+
+def test_check_is_in_main_menu_and_registered_as_bot_command():
+    notifier = FakeNotifier()
+    controller = make_controller(notifier=notifier)
+    assert any(
+        button.get("callback_data") == MENU_CHECK
+        for row in main_menu_keyboard()["inline_keyboard"]
+        for button in row
+    )
+    asyncio.run(controller._configure_bot())
+    command_payload = next(payload for method, payload in notifier.calls if method == "setMyCommands")
+    assert {item["command"]: item["description"] for item in command_payload["commands"]}["check"] == "Token ya da işlem kontrol et"
+
+
+def test_check_command_uses_shared_service_in_private_chat():
+    address = "0x" + "b" * 40
+    expected = TokenCheckResult(
+        "ethereum", address, ContractInfo(True, "Tether USD", "USDT", 6),
+        TokenAnalysis("CANONICAL", "USDT"),
+    )
+
+    class CheckServiceStub:
+        calls = []
+
+        async def check_token(self, network, token_address):
+            self.calls.append((network, token_address))
+            return expected
+
+    notifier = FakeNotifier()
+    controller = make_controller(notifier=notifier)
+    service = CheckServiceStub()
+    controller.check_service = service
+    asyncio.run(controller._handle_message({
+        "text": f"/check ethereum {address}",
+        "from": {"id": 321, "first_name": "Test"},
+        "chat": {"id": 321, "type": "private"},
+    }))
+    assert service.calls == [("ethereum", address)]
+    assert f"<code>{address}</code>" in notifier.sent[0][1].text
+
+
+def test_check_menu_waits_for_input_then_edits_prompt_with_result():
+    address = "0x" + "c" * 40
+    result = TokenCheckResult(
+        "ethereum", address, ContractInfo(True, "Tether USD", "USDT", 6),
+        TokenAnalysis("CANONICAL", "USDT"),
+    )
+
+    class CheckServiceStub:
+        async def check_token(self, network, token_address):
+            return result
+
+    notifier = FakeNotifier()
+    controller = make_controller(notifier=notifier)
+    controller.check_service = CheckServiceStub()
+    asyncio.run(controller._dispatch_callback(MENU_CHECK, "321", "321", 15, {"id": 321}))
+    assert controller._pending_checks["321"].message_id == 15
+    asyncio.run(controller._handle_message({
+        "text": address,
+        "from": {"id": 321},
+        "chat": {"id": 321, "type": "private"},
+    }))
+    assert "Token Kontrolü" in notifier.edited[-1][2].text
+    assert "321" not in controller._pending_checks
 
 
 def test_group_start_only_sends_private_bot_url_button():
