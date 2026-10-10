@@ -25,6 +25,7 @@ class Settings:
     monitor_max_interval: float
     telegram_bot_token: str
     telegram_chat_id: str
+    activity_log_chat_id: str
     admin_ids: tuple[str, ...]
     data_dir: str
     heartbeat_url: str
@@ -87,6 +88,7 @@ def load_settings() -> Settings:
         monitor_max_interval=float(os.getenv("MONITOR_MAX_INTERVAL", os.getenv("MAX_POLL_INTERVAL", "30"))),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+        activity_log_chat_id=os.getenv("ACTIVITY_LOG_CHAT_ID", "").strip(),
         admin_ids=tuple(dict.fromkeys(value.strip() for value in os.getenv("ADMIN_IDS", "").split(",") if value.strip().isdigit())),
         data_dir=os.getenv("DATA_DIR", "./data"),
         heartbeat_url=os.getenv("HEARTBEAT_URL", "").strip(),

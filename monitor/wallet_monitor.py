@@ -205,6 +205,7 @@ class WalletMonitorManager:
         self._monitors: dict[tuple[str, str], WalletMonitor] = {}
         self._effective_interval = min(settings.monitor_max_interval, max(settings.monitor_min_interval, poll_interval))
         self._last_interval_log = self._effective_interval
+        self._last_interval_log_at = 0.0
 
     async def _run_wallet(self, network: str, wallet_address: str, stagger: float = 0.0) -> None:
         provider = self.providers.get(network)
@@ -285,9 +286,11 @@ class WalletMonitorManager:
         for pool in pools:
             if getattr(pool, "_metrics", None) is not None:
                 pool._metrics.monitor_interval = self._effective_interval
-        if self._effective_interval != self._last_interval_log:
+        now = time.monotonic()
+        if now - self._last_interval_log_at >= 60:
             logger.info("İzleme aralığı bütçeye göre %.2f saniye olarak ayarlandı.", self._effective_interval)
             self._last_interval_log = self._effective_interval
+            self._last_interval_log_at = now
         for monitor in self._monitors.values():
             monitor.poll_interval = self._effective_interval
 

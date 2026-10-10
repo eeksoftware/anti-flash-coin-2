@@ -34,6 +34,14 @@ Bu sürüm yalnızca TRC-20 token transferlerini izler. TRX yerel para transferl
 🔗 İşlem: <code>...</code>
 ~~~
 
+## Geri bildirim ve cüzdan ayarları
+
+Transfer bildirimindeki düğmeler tespiti değiştirmez. `CORRECT`, `FALSE_POSITIVE` ve `UNSURE` değerleri `data/user_state.sqlite` içinde ilgili transfer kaydına bağlanır. Son tercih geçerlidir; aynı düğme kaydı çoğaltmaz.
+
+`expected` alanı yalnızca `gercek`, `sahte` ve `supheli` olmaya devam eder. `CORRECT` resmi tespiti `gercek`, bilinen sahte tespiti `sahte`, varyant veya bilinmeyen tespiti `supheli` yapar. `FALSE_POSITIVE` resmi olmayan bir tespiti `gercek` yapar; bu, yanlış alarmdır. `UNSURE` bu alana kesin etiket yazmaz. `expected_source=manual` olan etiketler korunur.
+
+Cüzdan ayarları izlenen adresi değiştirmez. Takma ad boş olabilir. Minimum tutar o transferin kendi token miktarıdır; tokenlar birbirine veya USD'ye çevrilmez. `0` filtreyi kapatır. Yalnızca şüpheli seçeneği mevcut sayaçla aynıdır: `VARIANT` ve `KNOWN_FRAUD`. Sessiz saatler UTC'dir. Başlangıç ve bitiş aynıysa bildirimler kapanmaz. Bu filtreler kaydı ve sınıflandırmayı silmez; yalnızca Telegram gönderimini atlar. Atlanan bildirimler kuyruğa alınmaz.
+
 ## Log formatı
 
 Log dosyaları LOG_DIR altında tutulur; varsayılan konum proje kökündeki logs/ klasörüdür. Klasör ihtiyaç olduğunda oluşturulur. LOG_LEVEL varsayılanı INFO, LOG_RETENTION_DAYS varsayılanı 90 gündür. Dosyalar her gün UTC gece yarısında döner. Gizli anahtarlar mesaj, argüman ve traceback'lerde maskelenir. Dosya yazma hataları uygulamanın çalışmasını durdurmaz.

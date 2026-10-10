@@ -8,6 +8,7 @@ from typing import Any
 import aiohttp
 
 from analyzer.token_analyzer import TokenAnalysis
+from audit_log import CLASSIFICATION_LABELS
 from blockchain.token_price import DexScreenerPriceClient, ETHEREUM_WETH_ADDRESS
 from blockchain.etherscan import EtherscanError, EtherscanRateLimitError, EtherscanTimeoutError
 from models.transaction import TokenTransfer
@@ -17,6 +18,14 @@ from services.check_input import InvalidCheckInput, parse_check_args
 from services.check_limits import CheckRateLimiter
 from services.check_service import CheckService
 from providers.tron import TronGridError, TronGridRateLimitError, TronGridTimeoutError
+from monitor.state_db import (
+    SettingsInputError,
+    UserStateStore,
+    parse_alias,
+    parse_feedback_callback,
+    parse_min_amount,
+    parse_quiet_hours,
+)
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore, WalletSubscription
 from notifications.telegram_formatter import (
@@ -41,15 +50,18 @@ from notifications.telegram_formatter import (
     format_remove_confirmation,
     format_remove_result,
     format_stale_menu,
+    format_setting_prompt,
     format_start,
     format_status,
     format_token_check,
     format_tx_check,
     format_transfer_alert,
     format_wallet_list,
+    format_wallet_settings,
     format_health_report,
     format_stats_report,
     format_watch_result,
+    escape,
 )
 from notifications.admin import admin_command_allowed
 from notifications.telegram_keyboards import (
@@ -65,11 +77,17 @@ from notifications.telegram_keyboards import (
     WALLET_ADD_PREFIX,
     WALLET_CANCEL,
     WALLET_HISTORY_PREFIX,
+    WALLET_ALIAS_PREFIX,
     WALLET_HISTORY_REFRESH_PREFIX,
     WALLET_LIST_PREFIX,
+    WALLET_MIN_PREFIX,
+    WALLET_QUIET_CLEAR_PREFIX,
+    WALLET_QUIET_PREFIX,
     WALLET_REMOVE_CANCEL_PREFIX,
     WALLET_REMOVE_CONFIRM_PREFIX,
     WALLET_REMOVE_PREFIX,
+    WALLET_SETTINGS_PREFIX,
+    WALLET_SUSPICIOUS_PREFIX,
     cancel_keyboard,
     history_result_keyboard,
     main_menu_keyboard,
@@ -77,6 +95,14 @@ from notifications.telegram_keyboards import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def format_activity_notice(sender: dict[str, Any], body: str) -> str:
+    user_id = escape(sender.get("id", ""))
+    name = escape(sender.get("first_name") or sender.get("username") or "kullanıcı")
+    username = sender.get("username")
+    handle = f" (@{escape(username)})" if isinstance(username, str) and username else ""
+    return f"👤 <b>{name}</b>{handle} · <code>{user_id}</code>\n{body}"
 
 
 class TelegramError(Exception):
@@ -93,6 +119,16 @@ class PendingAddress:
 
 @dataclass(frozen=True)
 class PendingCheck:
+    chat_id: str
+    message_id: int
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class PendingSetting:
+    network: str
+    address: str
+    field: str
     chat_id: str
     message_id: int
     expires_at: float
@@ -219,8 +255,14 @@ class TelegramNotifier:
         transfer: TokenTransfer,
         analysis: TokenAnalysis,
         chat_id: str | int | None = None,
+        *,
+        alias: str | None = None,
+        feedback_token: str | None = None,
     ) -> dict[str, Any]:
-        return await self.send_formatted(format_transfer_alert(transfer, analysis), chat_id)
+        return await self.send_formatted(
+            format_transfer_alert(transfer, analysis, alias=alias, feedback_token=feedback_token),
+            chat_id,
+        )
 
     async def send_api_status_alert(
         self,
@@ -252,6 +294,8 @@ class TelegramBotController:
         health_reporter=None,
         stats_reporter=None,
         operations_store=None,
+        activity_log_chat_id: str | None = None,
+        user_state: UserStateStore | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.monitor = monitor
@@ -263,12 +307,17 @@ class TelegramBotController:
         self.health_reporter = health_reporter
         self.stats_reporter = stats_reporter
         self.operations_store = operations_store
+        self.activity_log_chat_id = (
+            settings.activity_log_chat_id if activity_log_chat_id is None else activity_log_chat_id
+        )
         self.session: aiohttp.ClientSession | None = None
         self._offset: int | None = None
         self.bot_name = "Anti-Flash Token Bot"
         self.bot_username: str | None = None
+        self.user_state = user_state
         self._pending_addresses: dict[str, PendingAddress] = {}
         self._pending_checks: dict[str, PendingCheck] = {}
+        self._pending_settings: dict[str, PendingSetting] = {}
         self._check_rate_limiter = CheckRateLimiter()
 
     async def run(self) -> None:
@@ -411,6 +460,7 @@ class TelegramBotController:
         if command == "/start":
             self._pending_addresses.pop(user_id, None)
             self._pending_checks.pop(user_id, None)
+            self._pending_settings.pop(user_id, None)
             await self._send(
                 chat_id,
                 format_start(
@@ -419,6 +469,7 @@ class TelegramBotController:
                     len(self.wallet_store.for_user(user_id)),
                 ),
             )
+            await self._report_activity(sender, "▶️ Botu açtı", source_chat_id=chat_id)
             return
         if command == "/help":
             await self._send(chat_id, format_help())
@@ -431,15 +482,23 @@ class TelegramBotController:
                 await self._edit(pending_check.chat_id, pending_check.message_id, format_check_error("expired"))
                 return
             self._pending_checks.pop(user_id, None)
-            await self._handle_check([text.strip()], user_id, chat_id, pending_check.message_id)
+            await self._handle_check([text.strip()], user_id, chat_id, pending_check.message_id, sender)
             return
         if pending_check is not None and time.monotonic() >= pending_check.expires_at:
             self._pending_checks.pop(user_id, None)
             await self._edit(pending_check.chat_id, pending_check.message_id, format_check_error("expired"))
 
+        pending_setting = self._pending_settings.get(user_id)
+        if pending_setting is not None and not command.startswith("/"):
+            await self._accept_pending_setting(user_id, chat_id, text.strip(), pending_setting)
+            return
+        if pending_setting is not None and time.monotonic() >= pending_setting.expires_at:
+            self._pending_settings.pop(user_id, None)
+            await self._edit(pending_setting.chat_id, pending_setting.message_id, format_add_expired())
+
         pending = self._pending_addresses.get(user_id)
         if pending is not None and not command.startswith("/"):
-            await self._accept_pending_address(user_id, chat_id, text.strip(), pending)
+            await self._accept_pending_address(user_id, chat_id, text.strip(), pending, sender)
             return
         if pending is not None and time.monotonic() >= pending.expires_at:
             self._pending_addresses.pop(user_id, None)
@@ -448,15 +507,16 @@ class TelegramBotController:
         if command == "/status":
             await self._send(chat_id, format_status(self.wallet_store.for_user(user_id)))
         elif command == "/wallets":
-            await self._send(chat_id, format_wallet_list(self.wallet_store.for_user(user_id)))
+            wallets = self.wallet_store.for_user(user_id)
+            await self._send(chat_id, self._wallet_list(user_id, wallets))
         elif command == "/watch":
-            await self._handle_watch_command(parts, user_id, chat_id)
+            await self._handle_watch_command(parts, user_id, chat_id, sender)
         elif command == "/unwatch":
-            await self._handle_unwatch_command(parts, user_id, chat_id)
+            await self._handle_unwatch_command(parts, user_id, chat_id, sender)
         elif command == "/history":
-            await self._handle_history_command(parts, chat_id)
+            await self._handle_history_command(parts, chat_id, sender)
         elif command == "/check":
-            await self._handle_check(parts[1:], user_id, chat_id)
+            await self._handle_check(parts[1:], user_id, chat_id, sender=sender)
         else:
             logger.info("Bilinmeyen Telegram komutu yok sayıldı.")
 
@@ -466,6 +526,7 @@ class TelegramBotController:
         chat_id: str,
         address: str,
         pending: PendingAddress,
+        sender: dict[str, Any] | None = None,
     ) -> None:
         if time.monotonic() >= pending.expires_at:
             self._pending_addresses.pop(user_id, None)
@@ -491,8 +552,23 @@ class TelegramBotController:
             pending.message_id,
             format_watch_result(address, added, pending.network),
         )
+        await self._report_activity(
+            sender,
+            self._wallet_activity(
+                "eklendi" if added else "zaten izleniyor",
+                pending.network,
+                address_config.normalize_address(address),
+            ),
+            source_chat_id=chat_id,
+        )
 
-    async def _handle_watch_command(self, parts: list[str], user_id: str, chat_id: str) -> None:
+    async def _handle_watch_command(
+        self,
+        parts: list[str],
+        user_id: str,
+        chat_id: str,
+        sender: dict[str, Any] | None = None,
+    ) -> None:
         if len(parts) != 3:
             await self._send(chat_id, format_error("Kullanım: /watch <ağ> <adres>", main_menu_keyboard()))
             return
@@ -513,8 +589,19 @@ class TelegramBotController:
             await self._send(chat_id, format_error("Cüzdan kaydedilemedi."))
             return
         await self._send(chat_id, format_watch_result(address, added, network))
+        await self._report_activity(
+            sender,
+            self._wallet_activity("eklendi" if added else "zaten izleniyor", network, address),
+            source_chat_id=chat_id,
+        )
 
-    async def _handle_unwatch_command(self, parts: list[str], user_id: str, chat_id: str) -> None:
+    async def _handle_unwatch_command(
+        self,
+        parts: list[str],
+        user_id: str,
+        chat_id: str,
+        sender: dict[str, Any] | None = None,
+    ) -> None:
         if len(parts) != 3 or parts[1].lower() not in NETWORKS:
             await self._send(chat_id, format_error("Kullanım: /unwatch <ağ> <adres>", main_menu_keyboard()))
             return
@@ -526,8 +613,18 @@ class TelegramBotController:
         address = config.normalize_address(parts[2])
         removed = self.wallet_store.remove_wallet(user_id, network, address)
         await self._send(chat_id, format_remove_result(address, removed, network))
+        await self._report_activity(
+            sender,
+            self._wallet_activity("kaldırıldı" if removed else "kayıtlı değil", network, address),
+            source_chat_id=chat_id,
+        )
 
-    async def _handle_history_command(self, parts: list[str], chat_id: str) -> None:
+    async def _handle_history_command(
+        self,
+        parts: list[str],
+        chat_id: str,
+        sender: dict[str, Any] | None = None,
+    ) -> None:
         if len(parts) != 3 or parts[1].lower() not in NETWORKS:
             await self._send(chat_id, format_error("Kullanım: /history <ağ> <adres>", main_menu_keyboard()))
             return
@@ -536,7 +633,7 @@ class TelegramBotController:
         if not config.is_valid_address(parts[2]):
             await self._send(chat_id, format_error("Cüzdan adresi geçersiz.", main_menu_keyboard()))
             return
-        await self._show_history(chat_id, network, config.normalize_address(parts[2]))
+        await self._show_history(chat_id, network, config.normalize_address(parts[2]), sender=sender)
 
     async def _handle_check(
         self,
@@ -544,6 +641,7 @@ class TelegramBotController:
         user_id: str,
         chat_id: str,
         edit_message_id: int | None = None,
+        sender: dict[str, Any] | None = None,
     ) -> None:
         if self.operations_store is not None:
             self.operations_store.increment("check_usage")
@@ -581,15 +679,29 @@ class TelegramBotController:
         except (EtherscanRateLimitError, TronGridRateLimitError):
             if self.operations_store is not None: self.operations_store.increment("errors")
             message = format_check_error("rate_limit")
+            outcome = "Tamamlanamadı"
         except (EtherscanTimeoutError, EtherscanError, TronGridTimeoutError, TronGridError):
             if self.operations_store is not None: self.operations_store.increment("errors")
             logger.warning("Manuel kontrol sağlayıcı hatası: %s", "API_ERROR")
             message = format_check_error("provider")
+            outcome = "Tamamlanamadı"
         except Exception as exc:
             if self.operations_store is not None: self.operations_store.increment("errors")
             logger.warning("Manuel kontrol tamamlanamadı: %s", type(exc).__name__)
             message = format_check_error("provider")
+            outcome = "Tamamlanamadı"
+        else:
+            classification = (
+                result.analysis.classification if result.analysis is not None else "ERROR"
+            ) if request.kind == "token" else result.classification
+            outcome = CLASSIFICATION_LABELS.get(classification, classification)
         await self._show_formatted(chat_id, message, progress_message_id)
+        kind = "Token" if request.kind == "token" else "İşlem"
+        await self._report_activity(
+            sender,
+            f"🔎 {kind} kontrolü · {escape(request.network)}\n<code>{escape(request.value)}</code>\n{escape(outcome)}",
+            source_chat_id=chat_id,
+        )
 
     async def _handle_callback_query(self, callback: dict[str, Any]) -> None:
         callback_id = callback.get("id")
@@ -597,6 +709,10 @@ class TelegramBotController:
             return
         message = callback.get("message")
         sender = callback.get("from")
+        data = callback.get("data")
+        if isinstance(data, str) and data.startswith("fb:"):
+            await self._handle_feedback_callback(callback_id, data, message, sender)
+            return
         chat = message.get("chat") if isinstance(message, dict) else None
         is_private_self_chat = (
             isinstance(chat, dict)
@@ -647,7 +763,7 @@ class TelegramBotController:
                 len(wallets),
             ))
         elif data == MENU_WALLETS:
-            await self._edit(chat_id, message_id, format_wallet_list(wallets))
+            await self._edit(chat_id, message_id, self._wallet_list(user_id, wallets))
         elif data == MENU_ADD:
             await self._edit(chat_id, message_id, format_add_network())
         elif data == MENU_CHECK:
@@ -658,7 +774,7 @@ class TelegramBotController:
             await self._edit(chat_id, message_id, format_check_prompt())
         elif data == MENU_HISTORY:
             if not wallets:
-                await self._edit(chat_id, message_id, format_wallet_list(wallets))
+                await self._edit(chat_id, message_id, self._wallet_list(user_id, wallets))
             else:
                 await self._edit(
                     chat_id,
@@ -686,6 +802,7 @@ class TelegramBotController:
         elif data == WALLET_CANCEL:
             self._pending_addresses.pop(user_id, None)
             self._pending_checks.pop(user_id, None)
+            self._pending_settings.pop(user_id, None)
             await self._edit(chat_id, message_id, format_start(
                 self.bot_name,
                 str(sender.get("first_name") or "kullanıcı"),
@@ -698,21 +815,21 @@ class TelegramBotController:
                 await self._edit(chat_id, message_id, format_stale_menu())
                 return
             max_page = max(0, (len(wallets) - 1) // self.PAGE_SIZE)
-            await self._edit(chat_id, message_id, format_wallet_list(wallets, min(page, max_page), self.PAGE_SIZE))
+            await self._edit(chat_id, message_id, self._wallet_list(user_id, wallets, min(page, max_page), self.PAGE_SIZE))
         elif data.startswith(WALLET_HISTORY_REFRESH_PREFIX):
             decoded = self._decode_wallet_callback(data[len(WALLET_HISTORY_REFRESH_PREFIX):], wallets)
             if decoded is None:
                 await self._edit(chat_id, message_id, format_stale_menu())
                 return
             network, address = decoded
-            await self._show_history(chat_id, network, address, edit_message_id=message_id)
+            await self._show_history(chat_id, network, address, edit_message_id=message_id, sender=sender)
         elif data.startswith(WALLET_HISTORY_PREFIX):
             decoded = self._decode_wallet_callback(data[len(WALLET_HISTORY_PREFIX):], wallets)
             if decoded is None:
                 await self._edit(chat_id, message_id, format_stale_menu())
                 return
             network, address = decoded
-            await self._show_history(chat_id, network, address, edit_message_id=message_id)
+            await self._show_history(chat_id, network, address, edit_message_id=message_id, sender=sender)
         elif data.startswith(WALLET_REMOVE_CONFIRM_PREFIX):
             decoded = self._decode_wallet_callback(data[len(WALLET_REMOVE_CONFIRM_PREFIX):], wallets)
             if decoded is None:
@@ -728,12 +845,17 @@ class TelegramBotController:
             )
             if remaining and removed:
                 logger.info("Kullanıcı kendi cüzdan izleme kaydını kaldırdı.")
+            await self._report_activity(
+                sender,
+                self._wallet_activity("kaldırıldı" if removed else "kayıtlı değil", network, address),
+                source_chat_id=chat_id,
+            )
         elif data.startswith(WALLET_REMOVE_CANCEL_PREFIX):
             decoded = self._decode_wallet_callback(data[len(WALLET_REMOVE_CANCEL_PREFIX):], wallets)
             if decoded is None:
                 await self._edit(chat_id, message_id, format_stale_menu())
                 return
-            await self._edit(chat_id, message_id, format_wallet_list(wallets, page_size=self.PAGE_SIZE))
+            await self._edit(chat_id, message_id, self._wallet_list(user_id, wallets, page_size=self.PAGE_SIZE))
         elif data.startswith(WALLET_REMOVE_PREFIX):
             decoded = self._decode_wallet_callback(data[len(WALLET_REMOVE_PREFIX):], wallets)
             if decoded is None:
@@ -741,6 +863,8 @@ class TelegramBotController:
                 return
             network, address = decoded
             await self._edit(chat_id, message_id, format_remove_confirmation(address, network))
+        elif self._is_settings_callback(data):
+            await self._handle_settings_callback(data, user_id, chat_id, message_id, wallets)
         else:
             await self._edit(chat_id, message_id, format_stale_menu())
 
@@ -767,9 +891,15 @@ class TelegramBotController:
         network: str,
         address: str,
         edit_message_id: int | None = None,
+        sender: dict[str, Any] | None = None,
     ) -> None:
         config = get_network_config(network)
         address = config.normalize_address(address)
+        await self._report_activity(
+            sender,
+            f"📜 Geçmiş · {escape(network)}\n<code>{escape(address)}</code>",
+            source_chat_id=chat_id,
+        )
         keyboard = history_result_keyboard(address, network)
         progress_message_id = await self._show_progress(
             chat_id, format_history_loading(address), edit_message_id
@@ -827,6 +957,205 @@ class TelegramBotController:
             await self._edit(chat_id, edit_message_id, message)
             return edit_message_id
         return await self._send(chat_id, message)
+
+    def _aliases(self, user_id: str, wallets: list[WalletSubscription]) -> dict[tuple[str, str], str]:
+        if self.user_state is None:
+            return {}
+        found: dict[tuple[str, str], str] = {}
+        for wallet in wallets:
+            try:
+                prefs = self.user_state.settings(user_id, wallet.network, wallet.wallet_address)
+            except Exception:
+                logger.warning("Cüzdan ayarları okunamadı; liste varsayılan adla gösteriliyor.")
+                continue
+            if prefs.alias:
+                found[(wallet.network, wallet.wallet_address)] = prefs.alias
+        return found
+
+    def _wallet_list(self, user_id: str, wallets: list[WalletSubscription], page: int = 0, page_size: int = 8):
+        return format_wallet_list(wallets, page, page_size, self._aliases(user_id, wallets))
+
+    def _owns_wallet(self, user_id: str, network: str, address: str) -> bool:
+        return any(
+            item.network == network and item.wallet_address == address
+            for item in self.wallet_store.for_user(user_id)
+        )
+
+    @staticmethod
+    def _is_settings_callback(data: str) -> bool:
+        return data.startswith((
+            WALLET_SETTINGS_PREFIX,
+            WALLET_ALIAS_PREFIX,
+            WALLET_MIN_PREFIX,
+            WALLET_SUSPICIOUS_PREFIX,
+            WALLET_QUIET_PREFIX,
+            WALLET_QUIET_CLEAR_PREFIX,
+        ))
+
+    async def _handle_settings_callback(self, data, user_id, chat_id, message_id, wallets) -> None:
+        if data.startswith(WALLET_SETTINGS_PREFIX):
+            prefix = WALLET_SETTINGS_PREFIX
+            field = "open"
+        elif data.startswith(WALLET_ALIAS_PREFIX):
+            prefix, field = WALLET_ALIAS_PREFIX, "alias"
+        elif data.startswith(WALLET_MIN_PREFIX):
+            prefix, field = WALLET_MIN_PREFIX, "amount"
+        elif data.startswith(WALLET_SUSPICIOUS_PREFIX):
+            prefix, field = WALLET_SUSPICIOUS_PREFIX, "suspicious"
+        elif data.startswith(WALLET_QUIET_CLEAR_PREFIX):
+            prefix, field = WALLET_QUIET_CLEAR_PREFIX, "quiet_clear"
+        elif data.startswith(WALLET_QUIET_PREFIX):
+            prefix, field = WALLET_QUIET_PREFIX, "quiet"
+        else:
+            await self._edit(chat_id, message_id, format_stale_menu())
+            return
+        decoded = self._decode_wallet_callback(data[len(prefix):], wallets)
+        if decoded is None or self.user_state is None:
+            message = format_stale_menu() if decoded is None else format_error(
+                "Ayarlar şu an kullanılamıyor.", main_menu_keyboard(),
+            )
+            await self._edit(chat_id, message_id, message)
+            return
+        network, address = decoded
+        try:
+            prefs = self.user_state.settings(user_id, network, address)
+        except Exception:
+            logger.warning("Cüzdan ayarları okunamadı.")
+            await self._edit(chat_id, message_id, format_error(
+                "Ayarlar okunamadı. Mevcut izleme sürüyor.", main_menu_keyboard(),
+            ))
+            return
+        if field == "open":
+            await self._edit(chat_id, message_id, format_wallet_settings(address, network, prefs))
+            return
+        if field in {"alias", "amount", "quiet"}:
+            self._pending_addresses.pop(user_id, None)
+            self._pending_checks.pop(user_id, None)
+            self._pending_settings[user_id] = PendingSetting(
+                network, address, field, chat_id, message_id, time.monotonic() + self.PENDING_ADDRESS_TTL,
+            )
+            await self._edit(chat_id, message_id, format_setting_prompt(field, network))
+            return
+        from dataclasses import replace
+        if field == "suspicious":
+            updated = replace(prefs, suspicious_only=not prefs.suspicious_only)
+        else:
+            updated = replace(prefs, quiet_start=None, quiet_end=None)
+        try:
+            self.user_state.save_settings(user_id, network, address, updated)
+        except Exception:
+            logger.warning("Cüzdan ayarları kaydedilemedi.")
+            await self._edit(chat_id, message_id, format_error(
+                "Ayar kaydedilemedi. Mevcut izleme sürüyor.", main_menu_keyboard(),
+            ))
+            return
+        await self._edit(chat_id, message_id, format_wallet_settings(address, network, updated))
+
+    async def _accept_pending_setting(self, user_id: str, chat_id: str, text: str, pending: PendingSetting) -> None:
+        if time.monotonic() >= pending.expires_at or self.user_state is None:
+            self._pending_settings.pop(user_id, None)
+            await self._edit(pending.chat_id, pending.message_id, format_add_expired())
+            return
+        if chat_id != pending.chat_id or not self._owns_wallet(user_id, pending.network, pending.address):
+            self._pending_settings.pop(user_id, None)
+            await self._edit(pending.chat_id, pending.message_id, format_stale_menu())
+            return
+        try:
+            prefs = self.user_state.settings(user_id, pending.network, pending.address)
+            from dataclasses import replace
+            if pending.field == "alias":
+                alias = "" if text == "-" else parse_alias(text)
+                prefs = replace(prefs, alias=alias)
+            elif pending.field == "amount":
+                prefs = replace(prefs, min_amount=parse_min_amount(text))
+            elif pending.field == "quiet":
+                parsed = parse_quiet_hours(text)
+                if parsed is None:
+                    prefs = replace(prefs, quiet_start=None, quiet_end=None)
+                else:
+                    prefs = replace(prefs, quiet_start=parsed[0], quiet_end=parsed[1])
+            else:
+                raise SettingsInputError("Bu ayar değiştirilemedi.")
+        except SettingsInputError as exc:
+            await self._edit(pending.chat_id, pending.message_id, format_error(str(exc), cancel_keyboard()))
+            return
+        self.user_state.save_settings(user_id, pending.network, pending.address, prefs)
+        self._pending_settings.pop(user_id, None)
+        await self._edit(
+            pending.chat_id,
+            pending.message_id,
+            format_wallet_settings(pending.address, pending.network, prefs),
+        )
+
+    async def _handle_feedback_callback(self, callback_id: str, data: str, message, sender) -> None:
+        parsed = parse_feedback_callback(data)
+        chat = message.get("chat") if isinstance(message, dict) else None
+        private = (
+            isinstance(chat, dict)
+            and isinstance(sender, dict)
+            and chat.get("type") == "private"
+            and str(chat.get("id")) == str(sender.get("id"))
+        )
+        if not private or parsed is None or self.user_state is None:
+            await self._answer_feedback(callback_id, "Bu geri bildirim geçersiz.")
+            return
+        kind, token = parsed
+        user_id = str(sender.get("id"))
+        try:
+            record = self.user_state.feedback(token)
+        except Exception:
+            logger.warning("Geri bildirim kaydı okunamadı.")
+            await self._answer_feedback(callback_id, "Bu geri bildirim geçersiz.")
+            return
+        if record is None:
+            await self._answer_feedback(callback_id, "Bu geri bildirim geçersiz.")
+            return
+        if record.user_id != user_id or not self._owns_wallet(user_id, record.network, record.wallet_address):
+            await self._answer_feedback(callback_id, "Bu işlem için yetkin yok.")
+            return
+        try:
+            result = self.user_state.set_feedback(token, user_id, kind)
+        except Exception:
+            logger.warning("Geri bildirim kaydedilemedi.")
+            await self._answer_feedback(callback_id, "Geri bildirim kaydedilemedi.")
+            return
+        if result == "unchanged":
+            await self._answer_feedback(callback_id, "Geri bildirimin zaten kayıtlı.")
+        elif result == "updated":
+            await self._answer_feedback(callback_id, "Geri bildirimin kaydedildi.")
+        elif result == "unauthorized":
+            await self._answer_feedback(callback_id, "Bu işlem için yetkin yok.")
+        else:
+            await self._answer_feedback(callback_id, "Bu geri bildirim geçersiz.")
+
+    async def _answer_feedback(self, callback_id: str, text: str) -> None:
+        try:
+            await self.notifier.answer_callback_query(callback_id, text)
+        except TelegramError:
+            logger.warning("Geri bildirim yanıtı gönderilemedi.")
+
+    @staticmethod
+    def _wallet_activity(action: str, network: str, address: str) -> str:
+        return f"👛 Cüzdan {escape(action)} · {escape(network)}\n<code>{escape(address)}</code>"
+
+    async def _report_activity(
+        self,
+        sender: dict[str, Any] | None,
+        body: str,
+        *,
+        source_chat_id: str = "",
+    ) -> None:
+        target = str(self.activity_log_chat_id or "").strip()
+        if not target or not isinstance(sender, dict) or source_chat_id == target:
+            return
+        try:
+            await self.notifier.send_text(
+                format_activity_notice(sender, body),
+                chat_id=target,
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.warning("Kullanıcı işlemi aktivite grubuna iletilemedi.")
 
     async def _send(self, chat_id: str, message: FormattedMessage) -> int | None:
         try:

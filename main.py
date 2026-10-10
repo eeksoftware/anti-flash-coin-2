@@ -40,6 +40,7 @@ from blockchain.normalizer import normalize_etherscan_transfers
 from blockchain.token_price import DexScreenerPriceClient
 from config import settings
 from models.transaction import TokenTransfer
+from monitor.state_db import SUSPICIOUS_CLASSIFICATIONS, UserStateStore, skip_notification
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore
 from notifications.telegram import (
@@ -200,6 +201,7 @@ async def main() -> None:
     bot_version = get_version()
     health_state = HealthState.now()
     operations = None
+    user_state = None
     run_session_id = None
     clean_shutdown = False
     try:
@@ -219,6 +221,10 @@ async def main() -> None:
 
     try:
         wallet_store = WalletStateStore()
+        try:
+            user_state = UserStateStore(data_dir / "user_state.sqlite")
+        except Exception:
+            logger.exception("Kullanıcı ayar veritabanı açılamadı; varsayılan bildirim davranışı kullanılacak.")
         if settings.network in settings.enabled_networks:
             wallet_store.ensure_legacy_wallet(settings.network, settings.monitored_wallet)
 
@@ -268,7 +274,7 @@ async def main() -> None:
                 classification = analysis.classification if analysis is not None else "ERROR"
                 if operations:
                     increments = [("transfer_total", "", 1), (f"classification:{classification}", "", 1)]
-                    if classification in {"VARIANT", "KNOWN_FRAUD"}:
+                    if classification in SUSPICIOUS_CLASSIFICATIONS:
                         increments.append(("suspicious_total", "", 1))
                     if analysis_error:
                         increments.append(("errors", "", 1))
@@ -288,12 +294,51 @@ async def main() -> None:
                 notify_error = None
                 if analysis is not None and telegram is not None:
                     recipient = subscription.user_id or settings.telegram_chat_id
-                    if recipient:
+                    alias = None
+                    feedback_token = None
+                    send_alert = True
+                    if subscription.user_id and user_state is not None:
+                        try:
+                            prefs = user_state.settings(
+                                subscription.user_id, transfer.network, subscription.wallet_address,
+                            )
+                        except Exception:
+                            logger.warning("Cüzdan ayarları okunamadı; varsayılan bildirim kullanılacak.")
+                            prefs = None
+                        if prefs is not None:
+                            alias = prefs.alias or None
+                            reason = skip_notification(
+                                classification, transfer.amount, prefs, datetime.now(timezone.utc),
+                            )
+                            if reason:
+                                send_alert = False
+                                logger.info("Bildirim atlandı | neden=%s", reason)
+                            else:
+                                try:
+                                    feedback_token = user_state.register_alert(
+                                        user_id=subscription.user_id,
+                                        network=transfer.network,
+                                        wallet_address=subscription.wallet_address,
+                                        classification=classification,
+                                        record={
+                                            "network": transfer.network,
+                                            "tx_hash": transfer.tx_hash,
+                                            "log_index": transfer.log_index,
+                                            "event_key": transfer.event_key,
+                                            "token_address": transfer.token_address,
+                                            "wallet": subscription.wallet_address,
+                                        },
+                                    )
+                                except Exception:
+                                    logger.warning("Geri bildirim kaydı oluşturulamadı.")
+                    if send_alert and recipient:
                         try:
                             result = await telegram.send_transfer_alert(
                                 transfer,
                                 analysis,
                                 chat_id=recipient,
+                                alias=alias,
+                                feedback_token=feedback_token,
                             )
                             notified = True
                             if operations: operations.increment("notifications_sent")
@@ -428,6 +473,7 @@ async def main() -> None:
                     data_dir=data_dir, log_dir=log_dir,
                 ),
                 stats_reporter=lambda: build_stats_report(operations, providers),
+                user_state=user_state,
             )
             if telegram is not None
             else None
@@ -436,12 +482,6 @@ async def main() -> None:
         initial_report = build_health_report(state=health_state, provider=providers, store=wallet_store,
             operations=operations, version=bot_version, commit=get_git_commit(), data_dir=data_dir, log_dir=log_dir)
         await asyncio.to_thread(write_heartbeat, data_dir, health_state, initial_report["icon"])
-        if telegram is not None:
-            for admin_id in settings.admin_ids:
-                try:
-                    await telegram.send_text(f"🟢 Bot başladı · sürüm {bot_version}", chat_id=admin_id)
-                except Exception:
-                    logger.warning("Başlangıç bildirimi admin hesabına iletilemedi.")
         tasks = [asyncio.create_task(monitor.run()), asyncio.create_task(heartbeat())]
         if settings.heartbeat_url:
             tasks.append(asyncio.create_task(external_heartbeat()))
@@ -480,6 +520,8 @@ async def main() -> None:
                 await telegram_bot.close()
             if telegram is not None:
                 await telegram.close()
+            if user_state is not None:
+                user_state.close()
     except Exception:
         logger.exception("Bot beklenmeyen bir hatayla durdu.")
         raise

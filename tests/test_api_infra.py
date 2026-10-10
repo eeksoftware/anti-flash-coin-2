@@ -1,6 +1,8 @@
 import asyncio
+import logging
 
 from infra.cache import AsyncTTLCache
+from monitor.wallet_monitor import WalletMonitorManager
 from infra.key_pool import Outcome, PoolExhausted, RateLimitedPool
 from infra.rate_limiter import TokenBucket
 
@@ -53,3 +55,22 @@ def test_rate_limited_key_enters_cooldown():
         return lease.key_label, next_lease.key_label
     first, second = asyncio.run(run())
     assert first != second
+
+
+def test_monitor_interval_is_logged_once_per_minute(caplog):
+    manager = WalletMonitorManager(
+        client={},
+        store=object(),
+        poll_interval=1,
+        max_poll_interval=30,
+        normalizer=None,
+        on_transfers=lambda *_args: None,
+        on_api_status=lambda *_args: None,
+    )
+    with caplog.at_level(logging.INFO):
+        manager._adjust_interval(1)
+        manager._adjust_interval(1)
+        assert caplog.text.count("İzleme aralığı") == 1
+        manager._last_interval_log_at -= 60
+        manager._adjust_interval(1)
+    assert caplog.text.count("İzleme aralığı") == 2

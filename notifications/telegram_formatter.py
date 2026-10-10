@@ -131,7 +131,8 @@ def format_help() -> FormattedMessage:
         "🗑️ <b>/unwatch &lt;ağ&gt; &lt;adres&gt;</b> — cüzdanı kaldır\n",
         "🕘 <b>/history &lt;ağ&gt; &lt;adres&gt;</b> — son 10 ERC-20 transferini göster\n",
         "🔍 <b>/check [ağ] &lt;değer&gt;</b> — token ya da işlem kontrol et\n",
-        "📊 <b>/status</b> — izleme durumunu göster",
+        "📊 <b>/status</b> — izleme durumunu göster\n",
+        "⚙️ Cüzdan ayarları, Cüzdanlarım listesindeki Ayarlar düğmesindedir. Saatler UTC'dir.",
     ]
     return FormattedMessage(
         _with_separator("❓ <b>Yardım</b>", "\n".join(commands)),
@@ -211,16 +212,20 @@ def format_wallet_list(
     wallets: list[WalletSubscription],
     page: int = 0,
     page_size: int = 8,
+    aliases: dict[tuple[str, str], str] | None = None,
 ) -> FormattedMessage:
     if not wallets:
         body = "ℹ️ Henüz izlenen cüzdan yok."
     else:
         start = max(page, 0) * page_size
         current = wallets[start : start + page_size]
-        wallet_lines = [
-            f"<b>{index}.</b> {escape(wallet.network.capitalize())} · <code>{escape(wallet.wallet_address)}</code>"
-            for index, wallet in enumerate(current, start=start + 1)
-        ]
+        wallet_lines = []
+        for index, wallet in enumerate(current, start=start + 1):
+            line = f"<b>{index}.</b> {escape(wallet.network.capitalize())} · <code>{escape(wallet.wallet_address)}</code>"
+            alias = (aliases or {}).get((wallet.network, wallet.wallet_address), "")
+            if alias:
+                line += f" · {escape(alias)}"
+            wallet_lines.append(line)
         body = "\n".join(wallet_lines)
     return FormattedMessage(
         _with_separator("📋 <b>Cüzdanlarım</b>", body),
@@ -362,6 +367,9 @@ def format_stale_menu() -> FormattedMessage:
 def format_transfer_alert(
     transfer: TokenTransfer,
     analysis: TokenAnalysis,
+    *,
+    alias: str | None = None,
+    feedback_token: str | None = None,
 ) -> FormattedMessage:
     severity, classification = CLASSIFICATION_STYLE.get(
         analysis.classification, ("⚪", "Bilinmeyen token")
@@ -376,6 +384,8 @@ def format_transfer_alert(
     ]
     if name:
         rows.append(f"📄 Token: <code>{escape(name)}</code>")
+    if alias:
+        rows.append(f"👛 Takma ad: <code>{escape(alias)}</code>")
     rows.extend([
         f"🌐 Ağ: {escape(get_network_config(transfer.network).display_name)}",
         f"🛡️ Sınıflandırma: <b>{escape(classification)}</b>",
@@ -397,7 +407,49 @@ def format_transfer_alert(
             transfer.tx_hash,
             transfer.token_address,
             wallet_address,
+            feedback_token,
         ),
+    )
+
+
+def format_wallet_settings(address: str, network: str, prefs) -> FormattedMessage:
+    from notifications.telegram_keyboards import wallet_settings_keyboard
+
+    alias = prefs.alias or "Yok"
+    amount = format(prefs.min_amount, "f")
+    suspicious = "Açık" if prefs.suspicious_only else "Kapalı"
+    if prefs.quiet_start and prefs.quiet_end and prefs.quiet_start != prefs.quiet_end:
+        quiet = f"{prefs.quiet_start}–{prefs.quiet_end} UTC"
+    else:
+        quiet = "Yok"
+    body = "\n".join([
+        f"🌐 Ağ: {escape(get_network_config(network).display_name)}",
+        f"👛 Cüzdan: <code>{escape(address)}</code>",
+        f"✏️ Takma ad: <code>{escape(alias)}</code>",
+        f"💰 Minimum tutar: <b>{escape(amount)}</b>",
+        f"🚨 Yalnızca şüpheli: <b>{suspicious}</b>",
+        "ℹ️ Şüpheli filtre varyant ve bilinen sahte tokenları bırakır.",
+        f"🌙 Sessiz saat: <b>{escape(quiet)}</b>",
+        "ℹ️ Saatler UTC'dir. Başlangıç ve bitiş aynıysa filtre kapalıdır.",
+    ])
+    return FormattedMessage(
+        _with_separator("⚙️ <b>Cüzdan Ayarları</b>", body),
+        reply_markup=wallet_settings_keyboard(address, network),
+    )
+
+
+def format_setting_prompt(field: str, network: str) -> FormattedMessage:
+    prompts = {
+        "alias": "Takma adı gönder. Boşaltmak için - yaz. En fazla 32 karakter.",
+        "amount": "Minimum token tutarını gönder. 0 tüm tutarları kabul eder. Örnek: 1.5",
+        "quiet": "Sessiz saat aralığını UTC olarak gönder. Örnek: 22:00-08:00. Kapatmak için kapat yaz.",
+    }
+    return FormattedMessage(
+        _with_separator(
+            f"⚙️ <b>{escape(get_network_config(network).display_name)} ayarı</b>",
+            f"{escape(prompts[field])}\n⏳ Bu istek 5 dakika geçerlidir.",
+        ),
+        reply_markup=cancel_keyboard(),
     )
 
 

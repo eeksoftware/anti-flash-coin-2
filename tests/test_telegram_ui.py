@@ -7,7 +7,7 @@ from html.parser import HTMLParser
 from analyzer.token_analyzer import TokenAnalysis
 from models.transaction import TokenTransfer
 from monitor.wallet_store import WalletSubscription
-from notifications.telegram import TelegramBotController
+from notifications.telegram import TelegramBotController, format_activity_notice
 from notifications.telegram_formatter import (
     FormattedMessage,
     format_about,
@@ -305,6 +305,10 @@ class FakeNotifier:
         self.edited = []
         self.answered = []
         self.calls = []
+        self.texts = []
+
+    async def send_text(self, text, chat_id=None, parse_mode=None, **kwargs):
+        self.texts.append((str(chat_id), text, parse_mode))
 
     async def call_api(self, method, payload=None):
         self.calls.append((method, payload))
@@ -339,13 +343,14 @@ class Noop:
     pass
 
 
-def make_controller(store=None, notifier=None):
+def make_controller(store=None, notifier=None, activity_log_chat_id=""):
     return TelegramBotController(
         bot_token="token",
         monitor=Noop(),
         notifier=notifier or FakeNotifier(),
         wallet_store=store or FakeStore(),
         price_client=Noop(),
+        activity_log_chat_id=activity_log_chat_id,
     )
 
 
@@ -404,6 +409,7 @@ def test_check_command_uses_shared_service_in_private_chat():
     }))
     assert service.calls == [("ethereum", address)]
     assert any(f"<code>{address}</code>" in message.text for _, message in notifier.sent)
+    assert notifier.texts == []
 
 
 def test_check_menu_waits_for_input_then_edits_prompt_with_result():
@@ -487,6 +493,104 @@ def test_callback_from_another_user_cannot_fetch_wallet_history():
         {"id": "bob", "first_name": "Bob"},
     ))
     assert monitor.calls == []
+
+
+def test_user_check_is_copied_to_activity_group_without_changing_reply():
+    address = "0x" + "b" * 40
+    expected = TokenCheckResult(
+        "ethereum", address, ContractInfo(True, "Tether USD", "USDT", 6),
+        TokenAnalysis("CANONICAL", "USDT"),
+    )
+
+    class CheckServiceStub:
+        async def check_token(self, network, token_address):
+            return expected
+
+    notifier = FakeNotifier()
+    controller = make_controller(notifier=notifier, activity_log_chat_id="-5195283808")
+    controller.check_service = CheckServiceStub()
+    asyncio.run(controller._handle_message({
+        "text": f"/check ethereum {address}",
+        "from": {"id": 321, "first_name": "<Ada>", "username": "ada"},
+        "chat": {"id": 321, "type": "private"},
+    }))
+    assert any(f"<code>{address}</code>" in message.text for _, message in notifier.sent)
+    assert len(notifier.texts) == 1
+    chat_id, text, parse_mode = notifier.texts[0]
+    assert chat_id == "-5195283808"
+    assert parse_mode == "HTML"
+    assert "<b>&lt;Ada&gt;</b> (@ada)" in text
+    assert "<code>321</code>" in text
+    assert address in text
+    assert "Resmî token" in text
+    assert_balanced_html(text)
+
+
+def test_watch_activity_preserves_tron_address_case():
+    from notifications import telegram as telegram_mod
+
+    class Store(FakeStore):
+        def add_wallet(self, user_id, network, address):
+            self.added = (user_id, network, address)
+            return True
+
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    store = Store()
+    notifier = FakeNotifier()
+    controller = make_controller(store=store, notifier=notifier, activity_log_chat_id="-5195283808")
+    original = telegram_mod.NETWORKS
+    telegram_mod.NETWORKS = {**original, "tron": "🔷 TRON"}
+    try:
+        asyncio.run(controller._handle_message({
+            "text": f"/watch tron {address}",
+            "from": {"id": 321, "first_name": "Ada"},
+            "chat": {"id": 321, "type": "private"},
+        }))
+    finally:
+        telegram_mod.NETWORKS = original
+    assert store.added[2] == address
+    assert address in notifier.texts[0][1]
+    assert address.lower() not in notifier.texts[0][1]
+
+
+def test_activity_notice_keeps_tron_address_case_and_skips_the_log_group():
+    address = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    notice = format_activity_notice({"id": 9, "first_name": "Ada"}, f"<code>{address}</code>")
+    assert address in notice
+    assert address.lower() not in notice.replace(address, "")
+    notifier = FakeNotifier()
+    controller = make_controller(notifier=notifier, activity_log_chat_id="-5195283808")
+    asyncio.run(controller._report_activity(
+        {"id": 9, "first_name": "Ada"},
+        f"<code>{address}</code>",
+        source_chat_id="-5195283808",
+    ))
+    assert notifier.texts == []
+
+
+def test_activity_log_failure_does_not_block_the_user_reply():
+    address = "0x" + "d" * 40
+
+    class CheckServiceStub:
+        async def check_token(self, network, token_address):
+            return TokenCheckResult(
+                "ethereum", address, ContractInfo(True, "Tether USD", "USDT", 6),
+                TokenAnalysis("UNKNOWN"),
+            )
+
+    class FailingNotifier(FakeNotifier):
+        async def send_text(self, text, chat_id=None, parse_mode=None, **kwargs):
+            raise RuntimeError("grup kapalı")
+
+    notifier = FailingNotifier()
+    controller = make_controller(notifier=notifier, activity_log_chat_id="-5195283808")
+    controller.check_service = CheckServiceStub()
+    asyncio.run(controller._handle_message({
+        "text": f"/check ethereum {address}",
+        "from": {"id": 321, "first_name": "Ada"},
+        "chat": {"id": 321, "type": "private"},
+    }))
+    assert any("Bilinmeyen token" in message.text for _, message in notifier.sent)
 
 
 def test_history_refresh_callback_is_defined_and_short():

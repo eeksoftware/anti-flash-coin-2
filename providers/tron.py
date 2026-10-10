@@ -120,7 +120,11 @@ class TronProvider:
                 session = await self._ensure_session()
                 headers = {"TRON-PRO-API-KEY": lease.secret.reveal()}
                 url = f"{self.base_url}/{path.lstrip('/')}"
-                async with session.request(method, url, params=params, json=body, headers=headers) as response:
+                query = {
+                    key: "true" if value is True else "false" if value is False else value
+                    for key, value in (params or {}).items()
+                }
+                async with session.request(method, url, params=query, json=body, headers=headers) as response:
                     try:
                         payload = await response.json(content_type=None)
                     except (aiohttp.ClientError, ValueError):

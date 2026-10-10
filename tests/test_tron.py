@@ -216,7 +216,23 @@ def test_trongrid_key_is_header_only_and_never_appears_in_errors_or_logs(tmp_pat
     method, url, kwargs = session.calls[0]
     assert method == "GET" and "api.trongrid.io" in url and "sensitive-test-key" not in url
     assert kwargs["headers"] == {"TRON-PRO-API-KEY": "sensitive-test-key"}
+    assert kwargs["params"]["limit"] == 1
     assert "sensitive-test-key" not in caplog.text
+    asyncio.run(provider.close())
+
+
+def test_trongrid_bool_query_is_sent_as_text(tmp_path, monkeypatch):
+    monkeypatch.setattr(tron_module, "settings", make_settings(tmp_path, ["key"]))
+    session = FakeSession([(200, {"data": []})])
+    provider = TronProvider(session=session)
+    provider.pool = FakePool()
+    asyncio.run(provider._request(
+        "GET",
+        "/v1/accounts/TXtest/transactions/trc20",
+        params={"limit": 20, "only_confirmed": True},
+    ))
+    assert session.calls[0][2]["params"]["only_confirmed"] == "true"
+    assert session.calls[0][2]["params"]["limit"] == 20
     asyncio.run(provider.close())
 
 

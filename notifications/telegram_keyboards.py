@@ -1,6 +1,8 @@
+import re
 from typing import Any
 from urllib.parse import quote
 
+from monitor.state_db import feedback_callback
 from networks import get_enabled_networks, get_network_config
 
 
@@ -28,6 +30,12 @@ WALLET_REMOVE_PREFIX = "w:rm:"
 WALLET_REMOVE_CONFIRM_PREFIX = "w:rmok:"
 WALLET_REMOVE_CANCEL_PREFIX = "w:rmno:"
 WALLET_LIST_PREFIX = "w:list:"
+WALLET_SETTINGS_PREFIX = "w:set:"
+WALLET_ALIAS_PREFIX = "w:al:"
+WALLET_MIN_PREFIX = "w:mn:"
+WALLET_SUSPICIOUS_PREFIX = "w:so:"
+WALLET_QUIET_PREFIX = "w:qh:"
+WALLET_QUIET_CLEAR_PREFIX = "w:qc:"
 
 
 InlineKeyboard = dict[str, list[list[dict[str, Any]]]]
@@ -103,6 +111,7 @@ def wallets_keyboard(wallets: list[Any], page: int = 0, page_size: int = 8) -> I
             callback_button(f"🕘 Geçmiş #{index}", f"{WALLET_HISTORY_PREFIX}{address}"),
             callback_button(f"🗑️ Kaldır #{index}", f"{WALLET_REMOVE_PREFIX}{address}"),
         ])
+        rows.append([callback_button(f"⚙️ Ayarlar #{index}", f"{WALLET_SETTINGS_PREFIX}{address}")])
 
     if start > 0 or start + page_size < len(wallets):
         page_row: list[dict[str, Any]] = []
@@ -161,13 +170,40 @@ def remove_confirmation_keyboard(address: str, network: str = "ethereum") -> Inl
     ]])
 
 
-def transfer_alert_keyboard(network: str, tx_hash: str, token_address: str, wallet_address: str) -> InlineKeyboard:
+def wallet_settings_keyboard(address: str, network: str = "ethereum") -> InlineKeyboard:
+    value = _callback_value(network, address)
+    return inline_keyboard([
+        [callback_button("✏️ Takma ad", f"{WALLET_ALIAS_PREFIX}{value}")],
+        [callback_button("💰 Minimum tutar", f"{WALLET_MIN_PREFIX}{value}")],
+        [callback_button("🚨 Yalnızca şüpheli", f"{WALLET_SUSPICIOUS_PREFIX}{value}")],
+        [
+            callback_button("🌙 Sessiz saat", f"{WALLET_QUIET_PREFIX}{value}"),
+            callback_button("🔔 Sessizi kapat", f"{WALLET_QUIET_CLEAR_PREFIX}{value}"),
+        ],
+        [callback_button("⬅️ Cüzdanlarım", MENU_WALLETS)],
+    ])
+
+
+def transfer_alert_keyboard(
+    network: str,
+    tx_hash: str,
+    token_address: str,
+    wallet_address: str,
+    feedback_token: str | None = None,
+) -> InlineKeyboard:
     try:
         config = get_network_config(network)
     except ValueError:
         return inline_keyboard([])
-    return inline_keyboard([[
+    rows = [[
         url_button("🔍 İşlemi Aç", config.transaction_url(quote(tx_hash, safe=""))),
         url_button("📄 Kontratı Aç", config.token_url(quote(token_address, safe=""))),
         url_button("👛 Cüzdan", config.address_url(quote(wallet_address, safe=""))),
-    ]])
+    ]]
+    if feedback_token and re.fullmatch(r"[0-9a-f]{16}", feedback_token):
+        rows.append([
+            callback_button("👍 Doğru tespit", feedback_callback("CORRECT", feedback_token)),
+            callback_button("👎 Yanlış alarm", feedback_callback("FALSE_POSITIVE", feedback_token)),
+            callback_button("❓ Emin değilim", feedback_callback("UNSURE", feedback_token)),
+        ])
+    return inline_keyboard(rows)

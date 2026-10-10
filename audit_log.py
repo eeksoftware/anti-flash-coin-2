@@ -226,6 +226,24 @@ class _TransactionRouter(logging.Handler):
     def _merge_manual_evaluation(self, event_key: str, incoming: dict[str, Any]) -> None:
         if not incoming.get("expected"):
             return
+
+        def mutate(existing: dict[str, Any]) -> bool:
+            existing["expected"] = incoming["expected"]
+            existing["expected_source"] = "manual"
+            if incoming.get("note"):
+                existing["note"] = incoming["note"]
+            return True
+
+        self._rewrite_events(event_key, mutate)
+
+    def apply_feedback_expected(self, event_key: str, action: str, expected: str | None) -> bool:
+        def mutate(existing: dict[str, Any]) -> bool:
+            return _mutate_feedback_expected(existing, action, expected)
+
+        return self._rewrite_events(event_key, mutate)
+
+    def _rewrite_events(self, event_key: str, mutate) -> bool:
+        changed_any = False
         files = [
             (self.transactions.baseFilename, self.transactions),
             (self.detections.baseFilename, self.detections),
@@ -245,14 +263,11 @@ class _TransactionRouter(logging.Handler):
                         existing = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(existing, dict) and self._event_key(existing) == event_key:
-                        existing["expected"] = incoming["expected"]
-                        existing["expected_source"] = "manual"
-                        if incoming.get("note"):
-                            existing["note"] = incoming["note"]
+                    if isinstance(existing, dict) and self._event_key(existing) == event_key and mutate(existing):
                         lines[index] = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
                         changed = True
                 if changed:
+                    changed_any = True
                     temporary_path: str | None = None
                     try:
                         with tempfile.NamedTemporaryFile(
@@ -274,6 +289,7 @@ class _TransactionRouter(logging.Handler):
                     finally:
                         if temporary_path and os.path.exists(temporary_path):
                             os.unlink(temporary_path)
+        return changed_any
 
     def emit(self, log_record: logging.LogRecord) -> None:
         try:
@@ -593,6 +609,104 @@ def _transaction_payload(record: dict[str, Any]) -> dict[str, Any]:
     if payload["network"] == "tron":
         payload["confirmed"] = record.get("confirmed") if isinstance(record.get("confirmed"), bool) else None
     return payload
+
+
+def audit_event_key(record: dict[str, Any]) -> str:
+    return _TransactionRouter._event_key(record)
+
+
+def _mutate_feedback_expected(existing: dict[str, Any], action: str, expected: str | None) -> bool:
+    """Attach a feedback label without overwriting a manual evaluation or the classification."""
+    source = existing.get("expected_source")
+    if source == "manual":
+        return False
+    classification = existing.get("classification")
+    if action == "clear":
+        if source != "feedback":
+            return False
+        existing["expected"] = None
+        existing["expected_source"] = None
+        return True
+    if action != "set" or expected not in {"gercek", "sahte", "supheli"}:
+        return False
+    if existing.get("expected") not in (None, "") and source != "feedback":
+        return False
+    if existing.get("expected") == expected and source == "feedback":
+        return False
+    existing["expected"] = expected
+    existing["expected_source"] = "feedback"
+    existing["classification"] = classification
+    return True
+
+
+def _rewrite_feedback_files(log_dir: Path, event_key: str, action: str, expected: str | None) -> bool:
+    changed_any = False
+    for name in ("transactions.log", "detections.log"):
+        base = log_dir / name
+        if not base.parent.exists():
+            continue
+        for path in base.parent.glob(base.name + "*"):
+            if not path.is_file():
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            changed = False
+            updated: list[str] = []
+            for line in lines:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    updated.append(line)
+                    continue
+                if isinstance(record, dict) and _TransactionRouter._event_key(record) == event_key and _mutate_feedback_expected(record, action, expected):
+                    updated.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+                    changed = True
+                else:
+                    updated.append(line)
+            if not changed:
+                continue
+            changed_any = True
+            temporary_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=path.parent, prefix="audit-update-", delete=False,
+                ) as output:
+                    temporary_path = output.name
+                    output.write("\n".join(updated) + "\n")
+                os.replace(temporary_path, path)
+            finally:
+                if temporary_path and os.path.exists(temporary_path):
+                    os.unlink(temporary_path)
+    return changed_any
+
+
+def _transaction_router() -> _TransactionRouter | None:
+    runtime = _runtime
+    if runtime is None:
+        return None
+    for handler in runtime.handlers:
+        if isinstance(handler, _TransactionRouter):
+            return handler
+    return None
+
+
+def apply_feedback_expected(
+    event_key: str,
+    *,
+    action: str,
+    expected: str | None = None,
+    log_dir: str | Path | None = None,
+) -> bool:
+    """Update expected on an existing transfer log. Manual labels are left unchanged."""
+    router = _transaction_router()
+    target = Path(log_dir) if log_dir is not None else None
+    if router is not None and (target is None or target.resolve() == Path(router.transactions.baseFilename).resolve().parent):
+        return router.apply_feedback_expected(event_key, action, expected)
+    if target is None:
+        return False
+    return _rewrite_feedback_files(target, event_key, action, expected)
 
 
 def log_transaction(record: dict[str, Any]) -> bool:
