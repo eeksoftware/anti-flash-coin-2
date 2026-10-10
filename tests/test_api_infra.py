@@ -1,0 +1,55 @@
+import asyncio
+
+from infra.cache import AsyncTTLCache
+from infra.key_pool import Outcome, PoolExhausted, RateLimitedPool
+from infra.rate_limiter import TokenBucket
+
+
+def test_secret_is_masked_and_key_disabled_on_invalid():
+    pool = RateLimitedPool(["secret-value"], {"rate": 100, "burst": 2})
+    lease = asyncio.run(pool.acquire())
+    assert "secret-value" not in repr(lease)
+    pool.report(lease, Outcome.INVALID_KEY)
+    try:
+        asyncio.run(pool.acquire(timeout=0.01))
+    except PoolExhausted:
+        pass
+    else:
+        raise AssertionError("disabled key should not be leased")
+
+
+def test_token_bucket_waits_and_secret_wrapper_is_not_needed_for_metering():
+    now = [0.0]
+    async def sleep(delay): now[0] += delay
+    async def run():
+        bucket = TokenBucket(2, 1, clock=lambda: now[0], sleeper=sleep)
+        await bucket.acquire()
+        waited = await bucket.acquire()
+        return waited
+    assert asyncio.run(run()) >= 0.5
+
+
+def test_cache_ttl_lru_and_pending_skip():
+    now = [0.0]
+    cache = AsyncTTLCache(1, clock=lambda: now[0])
+    cache.set("a", 1, 5)
+    assert cache.get("a") == 1
+    cache.set("b", 2, 5)
+    assert cache.get("a") is None
+    cache.set("pending", 3, 10, pending=True)
+    assert cache.get("pending") is None
+    now[0] = 6
+    assert cache.get("b") is None
+
+
+def test_rate_limited_key_enters_cooldown():
+    now = [0.0]
+    async def sleep(delay): now[0] += delay
+    pool = RateLimitedPool(["one", "two"], {"rate": 100, "burst": 2}, clock=lambda: now[0], sleeper=sleep, jitter=lambda: 0)
+    async def run():
+        lease = await pool.acquire()
+        pool.report(lease, Outcome.RATE_LIMITED)
+        next_lease = await pool.acquire(timeout=0.1)
+        return lease.key_label, next_lease.key_label
+    first, second = asyncio.run(run())
+    assert first != second

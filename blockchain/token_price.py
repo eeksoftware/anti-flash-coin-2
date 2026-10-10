@@ -7,6 +7,8 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+ETHEREUM_WETH_ADDRESS = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+
 
 class DexScreenerPriceClient:
     """Fetch current USD prices by Ethereum token contract address."""

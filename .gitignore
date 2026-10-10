@@ -5,3 +5,5 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 runtime_state.json
+data/
+backups/

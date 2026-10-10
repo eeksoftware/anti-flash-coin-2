@@ -1,10 +1,16 @@
 from typing import Any
 from urllib.parse import quote
 
-from networks import NETWORKS as NETWORK_CONFIGS, get_network_config
+from networks import get_enabled_networks, get_network_config
 
 
-NETWORKS = {name: f"🔷 {config.display_name}" for name, config in NETWORK_CONFIGS.items()}
+NETWORKS = {name: f"🔷 {config.display_name}" for name, config in get_enabled_networks().items()}
+
+
+def _callback_value(network: str, address: str) -> str:
+    config = get_network_config(network)
+    normalized = config.normalize_address(address)
+    return f"{network}:{normalized}" if config.family == "tron" else normalized
 
 MENU_MAIN = "menu:main"
 MENU_WALLETS = "menu:wallets"
@@ -43,8 +49,8 @@ def main_menu_keyboard() -> InlineKeyboard:
     return inline_keyboard([
         [callback_button("➕ Cüzdan Ekle", MENU_ADD), callback_button("📋 Cüzdanlarım", MENU_WALLETS)],
         [callback_button("🕘 Geçmiş", MENU_HISTORY), callback_button("📊 Durum", MENU_STATUS)],
-        [callback_button("🔍 Kontrol Et", MENU_CHECK)],
         [callback_button("❓ Yardım", MENU_HELP), callback_button("ℹ️ Hakkında", MENU_ABOUT)],
+        [callback_button("🔍 Kontrol Et", MENU_CHECK)],
     ])
 
 
@@ -92,7 +98,7 @@ def wallets_keyboard(wallets: list[Any], page: int = 0, page_size: int = 8) -> I
     current = wallets[start : start + page_size]
     rows: list[list[dict[str, Any]]] = []
     for index, wallet in enumerate(current, start=start + 1):
-        address = wallet.wallet_address.lower()
+        address = _callback_value(wallet.network, wallet.wallet_address)
         rows.append([
             callback_button(f"🕘 Geçmiş #{index}", f"{WALLET_HISTORY_PREFIX}{address}"),
             callback_button(f"🗑️ Kaldır #{index}", f"{WALLET_REMOVE_PREFIX}{address}"),
@@ -114,16 +120,17 @@ def wallets_keyboard(wallets: list[Any], page: int = 0, page_size: int = 8) -> I
 
 def history_wallets_keyboard(wallets: list[Any]) -> InlineKeyboard:
     rows = [
-        [callback_button(f"🕘 Geçmiş #{index}", f"{WALLET_HISTORY_PREFIX}{wallet.wallet_address.lower()}")]
+        [callback_button(f"🕘 Geçmiş #{index}", f"{WALLET_HISTORY_PREFIX}{_callback_value(wallet.network, wallet.wallet_address)}")]
         for index, wallet in enumerate(wallets, 1)
     ]
     rows.append([callback_button("⬅️ Ana Menü", MENU_MAIN)])
     return inline_keyboard(rows)
 
 
-def history_result_keyboard(address: str) -> InlineKeyboard:
+def history_result_keyboard(address: str, network: str = "ethereum") -> InlineKeyboard:
+    value = _callback_value(network, address)
     return inline_keyboard([
-        [callback_button("🔄 Yenile", f"{WALLET_HISTORY_REFRESH_PREFIX}{address.lower()}")],
+        [callback_button("🔄 Yenile", f"{WALLET_HISTORY_REFRESH_PREFIX}{value}")],
         [callback_button("⬅️ Geri", MENU_HISTORY)],
     ])
 
@@ -146,10 +153,11 @@ def wallet_added_keyboard() -> InlineKeyboard:
     ]])
 
 
-def remove_confirmation_keyboard(address: str) -> InlineKeyboard:
+def remove_confirmation_keyboard(address: str, network: str = "ethereum") -> InlineKeyboard:
+    value = _callback_value(network, address)
     return inline_keyboard([[
-        callback_button("✅ Evet, kaldır", f"{WALLET_REMOVE_CONFIRM_PREFIX}{address.lower()}"),
-        callback_button("❌ Vazgeç", f"{WALLET_REMOVE_CANCEL_PREFIX}{address.lower()}"),
+        callback_button("✅ Evet, kaldır", f"{WALLET_REMOVE_CONFIRM_PREFIX}{value}"),
+        callback_button("❌ Vazgeç", f"{WALLET_REMOVE_CANCEL_PREFIX}{value}"),
     ]])
 
 

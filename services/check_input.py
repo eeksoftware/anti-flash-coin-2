@@ -23,7 +23,13 @@ class CheckRequest:
 
 def parse_check_args(args: list[str]) -> CheckRequest:
     if len(args) == 1:
-        network, value = "ethereum", args[0]
+        value = args[0]
+        if value.startswith("T") and len(value) == 34 and get_network_config("tron").is_valid_address(value):
+            network = "tron"
+        elif len(value.removeprefix("0x")) == 64 and not value.lower().startswith("0x"):
+            network = "tron"
+        else:
+            network = "ethereum"
     elif len(args) == 2:
         network, value = args[0], args[1]
         if network.strip().lower() not in NETWORKS:
@@ -35,9 +41,10 @@ def parse_check_args(args: list[str]) -> CheckRequest:
     if len(value) > MAX_CHECK_INPUT_LENGTH:
         raise InvalidCheckInput("Kullanım bilgisi")
     config = get_network_config(network)
-    normalized = value.lower()
-    if config.tx_hash_regex.fullmatch(normalized):
-        return CheckRequest(config.name, normalized, "transaction")
-    if config.address_regex.fullmatch(normalized):
-        return CheckRequest(config.name, normalized, "token")
+    normalized_hash = config.normalize_tx_hash(value)
+    normalized_address = config.normalize_address(value)
+    if config.is_valid_tx_hash(value):
+        return CheckRequest(config.name, normalized_hash, "transaction")
+    if config.is_valid_address(value):
+        return CheckRequest(config.name, normalized_address, "token")
     raise InvalidCheckInput("Kullanım bilgisi")

@@ -9,6 +9,8 @@ from models.transaction import TokenTransfer
 from monitor.transaction_tracker import TransactionTracker
 from monitor.wallet_store import WalletStateStore, WalletSubscription
 from providers.base import ChainProvider
+from infra.key_pool import CURRENT_PRIORITY, Priority
+from config import settings
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ class WalletMonitor:
         normalizer: Callable[[list[dict[str, Any]], str], list[TokenTransfer]] | None = None,
         on_transfers: Callable[[list[TokenTransfer]], Awaitable[None]] | None = None,
         on_api_status: Callable[[str], Awaitable[None]] | None = None,
+        health_state=None,
     ) -> None:
         self.client = client
         self.provider = client if callable(getattr(client, "get_transaction", None)) else None
@@ -40,9 +43,12 @@ class WalletMonitor:
         self.normalizer = normalizer
         self.on_transfers = on_transfers
         self.on_api_status = on_api_status
+        self.health_state = health_state
 
     def set_wallet_address(self, wallet_address: str) -> None:
-        wallet_address = wallet_address.lower()
+        if self.provider is not None:
+            from networks import get_network_config
+            wallet_address = get_network_config(getattr(self.provider, "network", "ethereum")).normalize_address(wallet_address)
         if wallet_address == self.wallet_address:
             return
         self.wallet_address = wallet_address
@@ -136,9 +142,14 @@ class WalletMonitor:
                 else:
                     logger.debug("Cüzdan kontrolü başarılı; yeni transfer yok.")
 
+                if self.health_state is not None:
+                    self.health_state.record_cycle(self.poll_interval)
+
                 await asyncio.sleep(self.poll_interval)
 
             except (BlockchainClientError, ValueError) as exc:
+                if self.health_state is not None:
+                    self.health_state.record_cycle(retry_interval, str(exc))
                 now = time.monotonic()
                 if failure_started_at is None:
                     failure_started_at = now
@@ -174,7 +185,13 @@ class WalletMonitorManager:
         normalizer: Callable[[list[dict[str, Any]], str], list[TokenTransfer]] | None,
         on_transfers: Callable[[WalletSubscription, list[TokenTransfer]], Awaitable[None]],
         on_api_status: Callable[[WalletSubscription, str], Awaitable[None]],
+        health_state=None,
     ) -> None:
+        if isinstance(client, dict):
+            self.providers = {str(name).lower(): value for name, value in client.items()}
+        else:
+            network = getattr(client, "network", "ethereum")
+            self.providers = {network: client} if callable(getattr(client, "get_transaction", None)) else {}
         self.client = client
         self.provider = client if callable(getattr(client, "get_transaction", None)) else None
         self.store = store
@@ -183,9 +200,16 @@ class WalletMonitorManager:
         self.normalizer = normalizer
         self.on_transfers = on_transfers
         self.on_api_status = on_api_status
+        self.health_state = health_state
         self._tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._monitors: dict[tuple[str, str], WalletMonitor] = {}
+        self._effective_interval = min(settings.monitor_max_interval, max(settings.monitor_min_interval, poll_interval))
+        self._last_interval_log = self._effective_interval
 
-    async def _run_wallet(self, network: str, wallet_address: str) -> None:
+    async def _run_wallet(self, network: str, wallet_address: str, stagger: float = 0.0) -> None:
+        provider = self.providers.get(network)
+        if provider is None:
+            return
         def current_subscriptions() -> list[WalletSubscription]:
             return [
                 item for item in self.store.all_subscriptions()
@@ -201,33 +225,71 @@ class WalletMonitorManager:
                 await self.on_api_status(subscription, status)
 
         monitor = WalletMonitor(
-            client=self.client,
+            client=provider,
             tracker=TransactionTracker(),
             wallet_address=wallet_address,
-            poll_interval=self.poll_interval,
+            poll_interval=self._effective_interval,
             max_poll_interval=self.max_poll_interval,
             normalizer=self.normalizer,
             on_transfers=transfers_callback,
             on_api_status=status_callback,
+            health_state=self.health_state,
         )
+        self._monitors[(network, wallet_address)] = monitor
+        if stagger:
+            await asyncio.sleep(stagger)
+        CURRENT_PRIORITY.set(Priority.BACKGROUND)
         await monitor.run()
 
     async def _sync(self) -> None:
         subscriptions = self.store.all_subscriptions()
         desired: dict[tuple[str, str], WalletSubscription] = {}
         for item in subscriptions:
-            if item.network == "ethereum":
+            if item.network in self.providers:
                 desired[(item.network, item.wallet_address)] = item
         for key in self._tasks.keys() - desired.keys():
             task = self._tasks.pop(key)
             task.cancel()
-        for key, subscription in desired.items():
+            self._monitors.pop(key, None)
+        self._adjust_interval(len(desired))
+        wallet_count = max(1, len(desired))
+        for index, (key, subscription) in enumerate(desired.items()):
             task = self._tasks.get(key)
             if task is None or task.done():
                 self._tasks[key] = asyncio.create_task(
-                    self._run_wallet(*key),
+                    self._run_wallet(*key, self._effective_interval * index / wallet_count),
                     name=f"wallet-monitor-{subscription.wallet_address}",
                 )
+
+    def _adjust_interval(self, wallet_count: int) -> None:
+        """Stretch polling only when the remaining shared daily budget requires it."""
+        pools = []
+        for provider in self.providers.values():
+            pool = getattr(provider, "pool", None) or getattr(getattr(provider, "client", None), "pool", None)
+            if pool is not None:
+                pools.append(pool)
+        target = max(settings.monitor_min_interval, self.poll_interval)
+        if pools and wallet_count:
+            budget = 0
+            for pool in pools:
+                active = [key for key in pool._keys if not key.disabled]
+                budget += max(0, len(active) * pool._daily_limit - sum(key.calls for key in active))
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            reset = now.replace(hour=settings.daily_reset_utc_hour % 24, minute=0, second=0, microsecond=0)
+            if reset <= now: reset += timedelta(days=1)
+            seconds_left = max(1.0, (reset-now).total_seconds())
+            required = wallet_count * seconds_left / max(1, budget)
+            target = max(target, required)
+        self._effective_interval = min(settings.monitor_max_interval, max(settings.monitor_min_interval, target))
+        for pool in pools:
+            if getattr(pool, "_metrics", None) is not None:
+                pool._metrics.monitor_interval = self._effective_interval
+        if self._effective_interval != self._last_interval_log:
+            logger.info("İzleme aralığı bütçeye göre %.2f saniye olarak ayarlandı.", self._effective_interval)
+            self._last_interval_log = self._effective_interval
+        for monitor in self._monitors.values():
+            monitor.poll_interval = self._effective_interval
 
     async def run(self) -> None:
         logger.info("Cüzdan izleme yöneticisi başlatıldı.")
@@ -245,10 +307,9 @@ class WalletMonitorManager:
     async def get_recent_transfers(
         self, network: str, wallet_address: str, limit: int = 10
     ) -> list[TokenTransfer]:
-        if network.lower() != "ethereum":
-            raise ValueError("Şu anda yalnızca ethereum ağı destekleniyor.")
-        if self.provider is not None:
-            return (await self.provider.get_token_transfers(wallet_address, limit))[:limit]
+        provider = self.providers.get(network.lower())
+        if provider is not None:
+            return (await provider.get_token_transfers(wallet_address, limit))[:limit]
         if self.normalizer is None:
             raise ValueError("Ham transfer normalizer yapılandırılmamış.")
         raw = await self.client.get_token_transfers(

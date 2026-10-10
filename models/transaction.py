@@ -27,6 +27,7 @@ class TokenTransfer:
     receiver: str
     direction: Direction
     event_key: str | None = None
+    confirmed: bool | None = None
 
     @property
     def event_id(self) -> tuple[str, str, str]:

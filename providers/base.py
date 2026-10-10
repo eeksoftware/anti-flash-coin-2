@@ -22,6 +22,8 @@ class TransactionInfo:
     confirmations: int | None
     from_address: str
     to_address: str | None
+    native_value: Decimal = Decimal(0)
+    confirmed: bool | None = None
 
 
 @dataclass(frozen=True)

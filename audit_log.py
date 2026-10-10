@@ -166,9 +166,27 @@ class _ResilientTimedRotatingHandler(logging.handlers.TimedRotatingFileHandler):
 class _TransactionRouter(logging.Handler):
     """Deduplicate transfer records in SQLite, then fan them out to JSONL logs."""
 
-    def __init__(self, log_dir: Path, retention_days: int) -> None:
+    def __init__(self, log_dir: Path, retention_days: int, data_dir: Path | None = None) -> None:
         super().__init__(logging.INFO)
-        self.db_path = log_dir / "seen_transactions.sqlite3"
+        self.db_path = (data_dir or log_dir) / "seen_transactions.sqlite3"
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_db = log_dir / "seen_transactions.sqlite3"
+        if data_dir is not None and self.db_path != legacy_db and not self.db_path.exists() and legacy_db.exists():
+            source = target = None
+            try:
+                source = sqlite3.connect(f"file:{legacy_db}?mode=ro", uri=True, timeout=5)
+                target = sqlite3.connect(self.db_path, timeout=5)
+                source.backup(target)
+                if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError("integrity check failed")
+                _stderr_warning("Eski transfer dedupe veritabanı DATA_DIR altına güvenle kopyalandı.")
+            except sqlite3.Error:
+                try: self.db_path.unlink()
+                except OSError: pass
+                _stderr_warning("Eski transfer dedupe veritabanı taşınamadı; eski dosya korundu.")
+            finally:
+                if source is not None: source.close()
+                if target is not None: target.close()
         self.transactions = _make_json_handler(log_dir / "transactions.log", retention_days)
         self.detections = _make_json_handler(log_dir / "detections.log", retention_days)
         self.connection: sqlite3.Connection | None = None
@@ -180,19 +198,28 @@ class _TransactionRouter(logging.Handler):
                 "CREATE TABLE IF NOT EXISTS seen (event_key TEXT PRIMARY KEY, first_seen TEXT NOT NULL)"
             )
             connection.commit()
+            try: os.chmod(self.db_path, 0o600)
+            except OSError: pass
             self.connection = connection
         return self.connection
 
     @staticmethod
     def _event_key(record: dict[str, Any]) -> str:
+        network = str(record.get("network", "")).lower()
         event_part = record.get("event_key")
         if not event_part:
             event_part = f"log:{record.get('log_index')}:{record.get('token_address', '')}"
+        wallet = str(record.get("wallet", ""))
+        try:
+            from networks import get_network_config
+            wallet = get_network_config(network).normalize_address(wallet)
+        except ValueError:
+            wallet = wallet.lower()
         key = [
-            str(record.get("network", "")).lower(),
+            network,
             str(record.get("tx_hash", "")).lower(),
             str(event_part).lower(),
-            str(record.get("wallet", "")).lower(),
+            wallet,
         ]
         return json.dumps(key, ensure_ascii=True, separators=(",", ":"))
 
@@ -341,6 +368,7 @@ def configure_logging(
     level: str | int | None = None,
     retention_days: int | None = None,
     *,
+    data_dir: str | Path | None = None,
     secrets: list[str] | None = None,
     force: bool = False,
 ) -> str:
@@ -390,7 +418,12 @@ def configure_logging(
             ))
             app_handler.addFilter(_LoggerRoute(("audit.transactions", "audit.tests"), include=False))
             handlers.append(app_handler)
-            transaction_router = _TransactionRouter(resolved_dir, retention)
+            resolved_data_dir = None
+            if data_dir is not None:
+                raw_data_dir = Path(data_dir)
+                resolved_data_dir = raw_data_dir if raw_data_dir.is_absolute() else PROJECT_ROOT / raw_data_dir
+                resolved_data_dir.mkdir(parents=True, exist_ok=True)
+            transaction_router = _TransactionRouter(resolved_dir, retention, resolved_data_dir)
             transaction_router.addFilter(_LoggerRoute(("audit.transactions",), include=True))
             handlers.append(transaction_router)
             test_handler = _make_json_handler(resolved_dir / "tests.log", retention)
@@ -557,6 +590,8 @@ def _transaction_payload(record: dict[str, Any]) -> dict[str, Any]:
         "cached": record.get("cached") if isinstance(record.get("cached"), bool) else None,
         "no_token_transfers": record.get("no_token_transfers") if isinstance(record.get("no_token_transfers"), bool) else None,
     }
+    if payload["network"] == "tron":
+        payload["confirmed"] = record.get("confirmed") if isinstance(record.get("confirmed"), bool) else None
     return payload
 
 

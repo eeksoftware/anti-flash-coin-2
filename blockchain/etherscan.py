@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import os
+import random
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -10,9 +17,13 @@ import aiohttp
 from blockchain.base import BlockchainClient, BlockchainClientError
 from config import settings
 from networks import get_network_config
+from infra.cache import AsyncTTLCache
+from infra.key_pool import CURRENT_PRIORITY, Outcome, PoolExhausted, RateLimitedPool
+from infra.metrics import APIMetrics
 
 
 ETHEREUM = get_network_config("ethereum")
+logger = logging.getLogger(__name__)
 
 
 class EtherscanError(BlockchainClientError):
@@ -29,25 +40,22 @@ class EtherscanTimeoutError(EtherscanError):
 
 class EtherscanClient(BlockchainClient):
     BASE_URL = "https://api.etherscan.io/v2/api"
-    # One shared client paces wallet pollers and manual checks below the free
-    # tier's observed throttle.
-    MIN_REQUEST_INTERVAL = 1.0
-
     def __init__(self) -> None:
-        self.api_key = settings.etherscan_api_key
+        self.metrics = APIMetrics()
+        self.pool = RateLimitedPool(settings.etherscan_api_keys, {
+            "rate": settings.etherscan_rate_per_key, "burst": settings.etherscan_burst,
+            "daily_limit": settings.etherscan_daily_limit,
+            "daily_soft_ratio": settings.etherscan_daily_soft_ratio, "metrics": self.metrics,
+            "db_path": str((Path(settings.data_dir) if Path(settings.data_dir).is_absolute() else Path(__file__).resolve().parents[1] / settings.data_dir) / "api_usage.sqlite"), "provider": "etherscan",
+        })
+        self.cache = AsyncTTLCache(settings.cache_max_entries)
+        self._log_dir = Path(settings.log_dir)
+        if not self._log_dir.is_absolute(): self._log_dir = Path(__file__).resolve().parents[1] / self._log_dir
+        self._singleflight: dict[tuple, asyncio.Task] = {}
+        self._singleflight_lock = asyncio.Lock()
+        self._metrics_task: asyncio.Task | None = None
+        self.health_state = None
         self.session: aiohttp.ClientSession | None = None
-        self._request_lock = asyncio.Lock()
-        self._last_request_started: float | None = None
-
-    async def _wait_for_request_slot(self) -> None:
-        async with self._request_lock:
-            loop = asyncio.get_running_loop()
-            now = loop.time()
-            if self._last_request_started is not None:
-                delay = self.MIN_REQUEST_INTERVAL - (now - self._last_request_started)
-                if delay > 0:
-                    await asyncio.sleep(delay)
-            self._last_request_started = loop.time()
 
     async def start(self) -> None:
         if self.session is None or self.session.closed:
@@ -55,35 +63,127 @@ class EtherscanClient(BlockchainClient):
                 timeout=aiohttp.ClientTimeout(total=10),
                 headers={"User-Agent": "AntiFlashToken/1.0"},
             )
+        if self._metrics_task is None or self._metrics_task.done():
+            self._metrics_task = asyncio.create_task(self._write_metrics_periodically())
 
     async def close(self) -> None:
+        if self._metrics_task:
+            self._metrics_task.cancel()
+            await asyncio.gather(self._metrics_task, return_exceptions=True)
+            self._metrics_task = None
         if self.session and not self.session.closed:
             await self.session.close()
+        self.pool.flush()
+
+    async def _write_metrics_periodically(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "bot_version": os.getenv("BOT_VERSION", "unknown"),
+                "provider": "etherscan",
+                "window": self.metrics.take_window(),
+                "cache_hits": self.metrics.cache_hits,
+                "cache_misses": self.metrics.cache_misses,
+                "queue_wait_avg": self.metrics.snapshot()["queue_wait_avg"],
+                "queue_wait_max": self.metrics.snapshot()["queue_wait_max"],
+                "monitor_interval": self.metrics.monitor_interval,
+            }
+            path = self._log_dir / "api_usage.log"
+            await asyncio.to_thread(_append_json_line, path, record)
 
     async def _request(self, params: dict[str, Any]) -> dict[str, Any]:
-        if not self.api_key:
+        if not self.pool._keys:
             raise EtherscanError("ETHERSCAN_API_KEY yapılandırılmamış.")
+        key = ("etherscan", params.get("chainid", ""), params.get("module", ""), params.get("action", ""), AsyncTTLCache.normalize(params))
+        cached = self.cache.get(key)
+        if cached is not None:
+            self.metrics.cache_hits += 1
+            return cached
+        self.metrics.cache_misses += 1
+        async with self._singleflight_lock:
+            task = self._singleflight.get(key)
+            if task is None:
+                task = asyncio.create_task(self._request_uncached(params))
+                self._singleflight[key] = task
+        try:
+            data = await asyncio.shield(task)
+            ttl = _cache_ttl(params, data)
+            if ttl:
+                pending = params.get("action") == "eth_getTransactionByHash" and isinstance(data.get("result"), dict) and not data["result"].get("blockNumber")
+                self.cache.set(key, data, ttl, pending=pending)
+            return data
+        finally:
+            async with self._singleflight_lock:
+                if self._singleflight.get(key) is task and task.done():
+                    self._singleflight.pop(key, None)
+
+    async def _request_uncached(self, params: dict[str, Any]) -> dict[str, Any]:
         await self.start()
         assert self.session is not None
-        await self._wait_for_request_slot()
-        request_params = {**params, "apikey": self.api_key}
-        try:
-            async with self.session.get(self.BASE_URL, params=request_params) as response:
-                if response.status == 429:
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                timeout = (settings.api_acquire_timeout_background
+                           if CURRENT_PRIORITY.get().value == "BACKGROUND"
+                           else settings.api_acquire_timeout_interactive)
+                lease = await self.pool.acquire(timeout=timeout)
+            except PoolExhausted as exc:
+                raise EtherscanError(str(exc)) from None
+            started = time.monotonic()
+            outcome = Outcome.OK
+            try:
+                request_params = {**params, "apikey": lease.secret.reveal()}
+                async with self.session.get(self.BASE_URL, params=request_params) as response:
+                    if response.status == 429:
+                        raise EtherscanRateLimitError("Etherscan istek sınırına ulaşıldı.")
+                    response.raise_for_status()
+                    data = await response.json()
+                if not isinstance(data, dict):
+                    raise EtherscanError("Beklenmeyen Etherscan yanıt biçimi.")
+                message = " ".join((str(data.get("message", "")), str(data.get("result", "")))).lower()
+                if "no transactions found" in message:
+                    return data
+                if "max rate limit reached" in message or "rate limit" in message:
                     raise EtherscanRateLimitError("Etherscan istek sınırına ulaşıldı.")
-                response.raise_for_status()
-                data = await response.json()
-        except asyncio.TimeoutError as exc:
-            raise EtherscanTimeoutError("Etherscan isteğinin süresi doldu.") from exc
-        except aiohttp.ClientResponseError as exc:
-            if exc.status == 429:
-                raise EtherscanRateLimitError("Etherscan istek sınırına ulaşıldı.") from exc
-            raise EtherscanError("Etherscan isteği başarısız.") from exc
-        except aiohttp.ClientError as exc:
-            raise EtherscanError("Etherscan isteği başarısız.") from exc
-        if not isinstance(data, dict):
-            raise EtherscanError("Beklenmeyen Etherscan yanıt biçimi.")
-        return data
+                if "too many invalid api key attempts" in message:
+                    outcome = Outcome.RATE_LIMITED
+                    await asyncio.sleep(30)
+                    continue
+                if "invalid api key" in message:
+                    outcome = Outcome.INVALID_KEY
+                    raise EtherscanError("Etherscan API anahtarı geçersiz.")
+                if "free api access is not supported for this chain" in message:
+                    outcome = Outcome.UNSUPPORTED
+                    raise EtherscanError("Etherscan bu zinciri desteklemiyor.")
+                if "community free api limit reached" in message:
+                    outcome = Outcome.QUOTA_EXHAUSTED
+                    raise EtherscanError("Etherscan ortak API kotası tükendi.")
+                return data
+            except EtherscanRateLimitError as exc:
+                outcome = Outcome.RATE_LIMITED; last_error = exc
+            except asyncio.TimeoutError as exc:
+                outcome = Outcome.NETWORK_ERROR; last_error = EtherscanTimeoutError("Etherscan isteğinin süresi doldu.")
+                last_error.__cause__ = exc
+            except aiohttp.ClientResponseError as exc:
+                outcome = Outcome.RATE_LIMITED if exc.status == 429 else Outcome.NETWORK_ERROR
+                last_error = EtherscanRateLimitError("Etherscan istek sınırına ulaşıldı.") if exc.status == 429 else EtherscanError("Etherscan isteği başarısız.")
+            except aiohttp.ClientError as exc:
+                outcome = Outcome.NETWORK_ERROR; last_error = EtherscanError("Etherscan isteği başarısız."); last_error.__cause__ = exc
+            except EtherscanError:
+                raise
+            finally:
+                self.pool.report(lease, outcome)
+                self.metrics._latencies[lease.key_label].append(time.monotonic()-started)
+                if outcome is Outcome.OK and self.health_state is not None:
+                    self.health_state.last_api_success_at = datetime.now(timezone.utc)
+            if outcome in (Outcome.RATE_LIMITED, Outcome.NETWORK_ERROR) and attempt < 2:
+                await asyncio.sleep(min(4, .25*(2**attempt)) + random.uniform(0, .2))
+                continue
+            break
+        if last_error:
+            raise last_error from None
+        raise EtherscanError("Etherscan isteği başarısız.")
 
     @staticmethod
     def _raise_api_error(data: dict[str, Any], *, rpc: bool = False) -> None:
@@ -215,3 +315,30 @@ def _hex_int(value: Any, field_name: str) -> int:
     except ValueError:
         pass
     raise EtherscanError(f"Etherscan {field_name} yanıtı geçersiz.")
+
+
+def _cache_ttl(params: dict[str, Any], data: dict[str, Any]) -> float:
+    action = params.get("action")
+    result = data.get("result")
+    if data.get("status") == "0" and "no transactions found" in str(result).lower(): return 15.0
+    if action == "tokentx": return 5.0
+    if action in ("getsourcecode", "getcontractcreation"): return 86400.0
+    if action == "eth_getTransactionReceipt" and result is None: return 0.0
+    if action in ("eth_getTransactionByHash", "eth_getTransactionReceipt"): return 0.0
+    if action in ("eth_getCode", "eth_call") and result in ("0x", None): return 15.0
+    return 60.0 if action in ("eth_getBlockByNumber", "eth_blockNumber") else 0.0
+
+
+def _append_json_line(path: Path, record: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            modified_day = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).date()
+            today = datetime.now(timezone.utc).date()
+            if modified_day != today:
+                rotated = path.with_name(f"{path.name}.{modified_day.isoformat()}")
+                if not rotated.exists(): path.replace(rotated)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except OSError:
+        logger.warning("API kullanım metriği dosyaya yazılamadı.")

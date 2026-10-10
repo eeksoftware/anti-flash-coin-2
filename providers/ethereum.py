@@ -15,7 +15,7 @@ from providers.base import ContractInfo, TransactionInfo
 
 
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-_METADATA_TTL_SECONDS = 600.0
+_METADATA_TTL_SECONDS = 86400.0
 
 
 class EthereumProvider:
@@ -49,17 +49,25 @@ class EthereumProvider:
         from_address = str(tx.get("from") or "").lower()
         to_value = tx.get("to")
         to_address = str(to_value).lower() if isinstance(to_value, str) and to_value else None
+        native_value = Decimal(_hex_int(tx.get("value", "0x0"))).scaleb(-18)
         block_value = tx.get("blockNumber")
         if block_value in (None, "0x", ""):
-            return TransactionInfo(tx_id, "pending", None, None, None, from_address, to_address)
+            return TransactionInfo(
+                tx_id, "pending", None, None, None, from_address, to_address, native_value
+            )
 
         block_number = _hex_int(block_value)
         receipt = await self._get_receipt(tx_id)
         if receipt is None:
-            return TransactionInfo(tx_id, "pending", block_number, None, None, from_address, to_address)
+            return TransactionInfo(
+                tx_id, "pending", block_number, None, None, from_address, to_address, native_value
+            )
         status_value = receipt.get("status")
         status = "success" if _hex_int(status_value) != 0 else "failed"
         latest_block = await self.client.get_block_number()
+        confirmations = max(0, latest_block - block_number + 1)
+        if confirmations >= 12:
+            self._receipt_cache[tx_id] = (time.monotonic(), receipt)
         block = await self._get_block(block_number)
         timestamp = _hex_int(block.get("timestamp")) if block and block.get("timestamp") is not None else None
         block_time = datetime.fromtimestamp(timestamp, timezone.utc) if timestamp is not None else None
@@ -68,9 +76,10 @@ class EthereumProvider:
             status=status,
             block_number=block_number,
             block_time=block_time,
-            confirmations=max(0, latest_block - block_number + 1),
+            confirmations=confirmations,
             from_address=from_address,
             to_address=to_address,
+            native_value=native_value,
         )
 
     async def get_transaction_token_transfers(self, tx_hash: str) -> list[TokenTransfer]:
@@ -183,10 +192,11 @@ class EthereumProvider:
 
     async def _get_receipt(self, tx_hash: str) -> dict[str, Any] | None:
         cached = self._receipt_cache.get(tx_hash.lower())
-        if cached and time.monotonic() - cached[0] < 30:
+        if cached and time.monotonic() - cached[0] < 86400:
             return cached[1]
         receipt = await self.client.get_transaction_receipt(tx_hash)
-        self._receipt_cache[tx_hash.lower()] = (time.monotonic(), receipt)
+        if receipt is not None:
+            self._receipt_cache[tx_hash.lower()] = (time.monotonic(), receipt)
         return receipt
 
     async def _get_block(self, block_number: int) -> dict[str, Any] | None:

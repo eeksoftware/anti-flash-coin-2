@@ -8,6 +8,7 @@ from typing import Any, Iterable
 from analyzer.token_analyzer import TokenAnalysis
 from models.transaction import TokenTransfer
 from monitor.wallet_store import WalletSubscription
+from networks import get_network_config
 from notifications.telegram_keyboards import (
     InlineKeyboard,
     back_to_main_keyboard,
@@ -138,6 +139,51 @@ def format_help() -> FormattedMessage:
     )
 
 
+def format_health_report(report: dict[str, Any]) -> FormattedMessage:
+    icon = str(report.get("icon", "🟡"))
+    lines = [
+        f"{icon} <b>Sağlık Durumu · {escape(report.get('label', 'Uyarı'))}</b>",
+        SEPARATOR,
+        f"🤖 Sürüm: <code>{escape(report.get('version', 'unknown'))}</code> · Commit: <code>{escape(report.get('commit', 'unknown'))}</code>",
+        f"⏱️ Uptime: {escape(report.get('uptime', 'N/A'))} · İzlenen cüzdan: {escape(report.get('wallet_count', 'N/A'))}",
+        f"🔄 Son izleme: {escape(report.get('last_cycle', 'N/A'))} · Döngü: {escape(report.get('cycle_count', 'N/A'))} · Aralık: {escape(report.get('interval', 'N/A'))}",
+        f"⚠️ Son hata: {escape(report.get('last_error', 'Yok'))}",
+        f"🌐 API son başarı: {escape(report.get('last_api', 'N/A'))} · Telegram son başarı: {escape(report.get('last_telegram', 'N/A'))}",
+        f"💾 Log boyutu: {escape(report.get('log_size', 'N/A'))} · Disk boş: {escape(report.get('disk_free', 'N/A'))}",
+        f"🔁 Son 7 gün beklenmeyen kapanış: {escape(report.get('unexpected_restarts', 'N/A'))}",
+        SEPARATOR,
+    ]
+    keys = report.get("keys", [])
+    if keys:
+        lines.extend(f"🔑 {escape(row.get('label'))}: {escape(row.get('state'))} · {escape(row.get('usage'))}" for row in keys)
+    else:
+        lines.append("🔑 API key durumu: N/A")
+    return FormattedMessage("\n".join(lines))
+
+
+def format_stats_report(report: dict[str, Any]) -> FormattedMessage:
+    lines = ["📊 <b>İstatistikler</b>", SEPARATOR]
+    for period, title in (("today", "Bugün · UTC"), ("last24h", "Son 24 saat")):
+        data = report.get(period, {})
+        lines.extend([f"🕒 <b>{title}</b>",
+            f"Transfer: {escape(data.get('transfer_total', 'N/A'))} · Şüpheli/sahte: {escape(data.get('suspicious_total', 'N/A'))}",
+            f"Bildirim: {escape(data.get('notifications_sent', 'N/A'))} · Hata: {escape(data.get('errors', 'N/A'))} · /check: {escape(data.get('check_usage', 'N/A'))}"])
+        classes = data.get("classes", [])
+        lines.extend(f"  {escape(row['name'])}: {escape(row['count'])} (%{escape(row['percent'])})" for row in classes)
+        lines.append(SEPARATOR)
+    api = report.get("api", {})
+    lines.append("🌐 <b>API</b>")
+    lines.append(f"Rate limit: {escape(api.get('rate_limited', 'N/A'))} · Ortalama: {escape(api.get('latency_avg', 'N/A'))} · p95: {escape(api.get('latency_p95', 'N/A'))} · Cache hit: {escape(api.get('cache_hit_ratio', 'N/A'))}")
+    lines.extend(f"🔑 {escape(row.get('label'))}: {escape(row.get('calls'))}/{escape(row.get('limit'))} (%{escape(row.get('percent'))})" for row in api.get("keys", []))
+    for network, provider in api.get("providers", {}).items():
+        if network == api.get("primary_network", "ethereum"):
+            continue
+        lines.append(f"🌐 <b>{escape(get_network_config(network).display_name)} · API</b>")
+        lines.append(f"Rate limit: {escape(provider.get('rate_limited', 'N/A'))} · Ortalama: {escape(provider.get('latency_avg', 'N/A'))} · p95: {escape(provider.get('latency_p95', 'N/A'))} · Cache hit: {escape(provider.get('cache_hit_ratio', 'N/A'))}")
+        lines.extend(f"🔑 {escape(row.get('label'))}: {escape(row.get('calls'))}/{escape(row.get('limit'))} (%{escape(row.get('percent'))})" for row in provider.get("keys", []))
+    return FormattedMessage("\n".join(lines))
+
+
 def format_about() -> FormattedMessage:
     return FormattedMessage(
         _with_separator(
@@ -192,21 +238,24 @@ def format_add_network() -> FormattedMessage:
 
 
 def format_add_prompt(network: str) -> FormattedMessage:
+    config = get_network_config(network)
+    address_hint = "TRON Base58 adresi (T ile başlayan) gönder.\n" if network == "tron" else "İzlenecek cüzdan adresini gönder (0x ile başlamalı).\n"
     return FormattedMessage(
         _with_separator(
-            f"➕ <b>{escape(network.capitalize())} cüzdanı ekle</b>",
-            "İzlenecek cüzdan adresini gönder (0x ile başlamalı).\n"
+            f"➕ <b>{escape(config.display_name)} cüzdanı ekle</b>",
+            address_hint +
             "⏳ Bu istek 5 dakika geçerlidir.",
         ),
         reply_markup=cancel_keyboard(),
     )
 
 
-def format_add_invalid() -> FormattedMessage:
+def format_add_invalid(network: str = "ethereum") -> FormattedMessage:
+    hint = "Geçerli bir TRON Base58 adresi gönder.\nAdres büyük/küçük harfe duyarlıdır.\n" if network == "tron" else "Geçerli bir Ethereum 0x cüzdan adresi gönder.\n"
     return FormattedMessage(
         _with_separator(
             "❌ <b>Geçersiz adres</b>",
-            "Geçerli bir Ethereum 0x cüzdan adresi gönder.\nAdres bekleme süresi devam ediyor.",
+            hint + "Adres bekleme süresi devam ediyor.",
         ),
         reply_markup=cancel_keyboard(),
     )
@@ -222,13 +271,18 @@ def format_add_expired() -> FormattedMessage:
     )
 
 
-def format_watch_result(address: str, added: bool) -> FormattedMessage:
+def format_watch_result(address: str, added: bool, network: str = "ethereum") -> FormattedMessage:
+    from networks import get_network_config
+    config = get_network_config(network)
+    address = config.normalize_address(address)
+    address_row = f"👛 <code>{escape(address)}</code>"
     if added:
         title = "✅ <b>Cüzdan izlemeye eklendi</b>"
-        body = f"🌐 Ethereum\n👛 <code>{escape(address.lower())}</code>"
+        body = f"🌐 {escape(config.display_name)}\n{address_row}"
     else:
         title = "ℹ️ <b>Cüzdan zaten izleniyor</b>"
-        body = f"👛 <code>{escape(address.lower())}</code>"
+        network_prefix = f"🌐 {escape(config.display_name)}\n" if config.family == "tron" else ""
+        body = f"{network_prefix}{address_row}"
     return FormattedMessage(_with_separator(title, body), reply_markup=wallet_added_keyboard())
 
 
@@ -239,29 +293,33 @@ def format_watch_error(message: str) -> FormattedMessage:
     )
 
 
-def format_remove_confirmation(address: str) -> FormattedMessage:
+def format_remove_confirmation(address: str, network: str = "ethereum") -> FormattedMessage:
+    from networks import get_network_config
+    address = get_network_config(network).normalize_address(address)
     return FormattedMessage(
         _with_separator(
             "⚠️ <b>Cüzdanı kaldır?</b>",
-            f"<code>{escape(address.lower())}</code>",
+            f"<code>{escape(address)}</code>",
         ),
-        reply_markup=remove_confirmation_keyboard(address),
+        reply_markup=remove_confirmation_keyboard(address, network),
     )
 
 
-def format_remove_result(address: str, removed: bool) -> FormattedMessage:
+def format_remove_result(address: str, removed: bool, network: str = "ethereum") -> FormattedMessage:
+    from networks import get_network_config
+    address = get_network_config(network).normalize_address(address)
     if removed:
         return FormattedMessage(
             _with_separator(
                 "✅ <b>Cüzdan izleme listesinden kaldırıldı</b>",
-                f"<code>{escape(address.lower())}</code>",
+                f"<code>{escape(address)}</code>",
             ),
             reply_markup=back_to_main_keyboard(),
         )
     return FormattedMessage(
         _with_separator(
             "⚠️ <b>Cüzdan izleme listende bulunamadı</b>",
-            f"<code>{escape(address.lower())}</code>",
+            f"<code>{escape(address)}</code>",
         ),
         reply_markup=back_to_main_keyboard(),
     )
@@ -319,7 +377,7 @@ def format_transfer_alert(
     if name:
         rows.append(f"📄 Token: <code>{escape(name)}</code>")
     rows.extend([
-        f"🌐 Ağ: {escape(transfer.network.capitalize())}",
+        f"🌐 Ağ: {escape(get_network_config(transfer.network).display_name)}",
         f"🛡️ Sınıflandırma: <b>{escape(classification)}</b>",
     ])
     if analysis.classification in {"VARIANT", "KNOWN_FRAUD"}:
@@ -374,19 +432,20 @@ def format_history(
     reply_markup: InlineKeyboard,
     max_units: int = MAX_TELEGRAM_TEXT_UNITS,
 ) -> list[FormattedMessage]:
+    from networks import get_network_config
     transfer_list = list(transfers)
     header = (
-        f"🕘 <b>Son {len(transfer_list)} ERC-20 Transferi</b>\n"
+        f"🕘 <b>Son {len(transfer_list)} {'TRC-20' if transfer_list and transfer_list[0].network == 'tron' else 'ERC-20'} Transferi</b>\n"
         f"{SEPARATOR}\n"
         f"👛 Cüzdan: <code>{escape(wallet_address)}</code>\n"
-        "🌐 Ağ: Ethereum"
+        f"🌐 Ağ: {escape(get_network_config(transfer_list[0].network).display_name if transfer_list else 'Ethereum')}"
     )
     chunks: list[str] = []
     current = header
     for transfer in transfer_list:
         entry = "\n" + _history_entry(
             transfer,
-            prices.get(transfer.token_address.lower()),
+            prices.get(transfer.token_address if transfer.network == "tron" else transfer.token_address.lower()),
         )
         if _utf16_units(current + entry) > max_units and current != header:
             chunks.append(current)
@@ -408,11 +467,14 @@ def format_history(
 def format_history_empty(
     wallet_address: str,
     reply_markup: InlineKeyboard,
+    network: str = "ethereum",
 ) -> FormattedMessage:
+    from networks import get_network_config
+    token_standard = "TRC-20" if network == "tron" else "ERC-20"
     return FormattedMessage(
         _with_separator(
             "📄 <b>Transfer Geçmişi</b>",
-            f"ℹ️ Bu cüzdan için ERC-20 transferi bulunamadı.\n👛 <code>{escape(wallet_address)}</code>",
+            f"ℹ️ Bu cüzdan için {token_standard} transferi bulunamadı.\n👛 <code>{escape(get_network_config(network).normalize_address(wallet_address))}</code>",
         ),
         reply_markup=reply_markup,
     )
@@ -449,9 +511,10 @@ def format_check_usage() -> FormattedMessage:
     return FormattedMessage(
         _with_separator(
             "🔍 <b>Token ya da işlem kontrol et</b>",
-            "Bir token kontratı veya işlem hash'i gönder. Ağ belirtilmezse Ethereum kullanılır.\n\n"
+            "Bir token kontratı veya işlem hash'i gönder. Ağ belirtilmezse adres biçimine göre ağ seçilir.\n\n"
             "Örnekler:\n<code>/check 0x0000000000000000000000000000000000000000</code>\n"
-            "<code>/check ethereum 0x0000000000000000000000000000000000000000000000000000000000000000</code>",
+            "<code>/check tron TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t</code>\n"
+            "<code>/check tron 0000000000000000000000000000000000000000000000000000000000000000</code>",
         ),
         reply_markup=back_to_main_keyboard(),
     )
@@ -464,6 +527,26 @@ def format_check_prompt() -> FormattedMessage:
             "Token kontratı ya da işlem hash'i gönder.\n⏳ Bu istek 5 dakika geçerlidir.",
         ),
         reply_markup=cancel_keyboard(),
+    )
+
+
+def format_check_loading() -> FormattedMessage:
+    return FormattedMessage(
+        _with_separator(
+            "⏳ <b>Kontrol sürüyor</b>",
+            "İşlem blokzincirde inceleniyor. Lütfen bekle.",
+        ),
+        reply_markup=back_to_main_keyboard(),
+    )
+
+
+def format_history_loading(address: str) -> FormattedMessage:
+    return FormattedMessage(
+        _with_separator(
+            "⏳ <b>Geçmiş hazırlanıyor</b>",
+            f"👛 Cüzdan: <code>{escape(address)}</code>\n"
+            "Transferler blokzincirden alınıyor. Lütfen bekle.",
+        ),
     )
 
 
@@ -500,7 +583,7 @@ def format_token_check(result) -> FormattedMessage:
     rows = [
         f"{severity} <b>Token Kontrolü · {escape(label)}</b>",
         SEPARATOR,
-        f"🌐 Ağ: {escape(result.network.capitalize())}",
+        f"🌐 Ağ: {escape(get_network_config(result.network).display_name)}",
         f"🪙 Token: <code>{escape(symbol)}</code>" + (f" ({escape(name)})" if name else ""),
         f"📄 Token kontratı: <code>{escape(result.token_address)}</code>",
         f"🛡️ Sınıflandırma: <b>{escape(label)}</b>",
@@ -518,7 +601,7 @@ def format_token_check(result) -> FormattedMessage:
     )
 
 
-def format_tx_check(result) -> FormattedMessage:
+def format_tx_check(result, *, eth_usd_price: Decimal | None = None) -> FormattedMessage:
     from notifications.telegram_keyboards import url_button
     from networks import get_network_config
 
@@ -527,17 +610,20 @@ def format_tx_check(result) -> FormattedMessage:
     config = get_network_config(result.network)
     classification = result.classification
     severity, label = CLASSIFICATION_STYLE.get(classification, CLASSIFICATION_STYLE["UNKNOWN"])
-    if not result.transfers:
-        label = "Token transferi yok"
     transaction = result.transaction
+    native_transfer = transaction.native_value > 0 and transaction.status == "success"
+    if not result.transfers:
+        label = "ETH transferi" if native_transfer else "Token transferi yok"
     status = {"success": "✅ Başarılı", "failed": "❌ Başarısız", "pending": "⏳ Beklemede"}.get(transaction.status, "⏳ Beklemede")
     rows = [
         f"{severity} <b>İşlem Kontrolü · {escape(label)}</b>",
         SEPARATOR,
-        f"🌐 Ağ: {escape(result.network.capitalize())}",
+        f"🌐 Ağ: {escape(get_network_config(result.network).display_name)}",
         f"🔗 TXID: <code>{escape(result.tx_hash)}</code>",
         status,
     ]
+    if result.network == "tron":
+        rows.append("✅ Ağda onaylandı" if transaction.confirmed else "⏳ Ağ onayı bekleniyor")
     if transaction.block_time:
         moment = transaction.block_time.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
         rows.append(f"🕒 {escape(moment)}")
@@ -555,7 +641,26 @@ def format_tx_check(result) -> FormattedMessage:
         None,
     )
     if not result.transfers:
-        rows.append("ℹ️ Bu işlemde ERC-20 token transferi bulunamadı.")
+        standard = "TRC-20" if result.network == "tron" else "ERC-20"
+        rows.append(f"ℹ️ Bu işlemde {standard} token transferi bulunamadı.")
+    if transaction.native_value > 0:
+        usd_value = format_usd(transaction.native_value, eth_usd_price)
+        usd_suffix = f" ({escape(usd_value)})" if usd_value is not None else " (USD fiyatı alınamadı)"
+        if native_transfer:
+            rows.extend([
+                SEPARATOR,
+                "💠 <b>ETH transferi</b>",
+                f"🪙 Miktar: <b>{escape(format_token_amount(transaction.native_value))} <code>ETH</code>{usd_suffix}</b>",
+                f"📤 Gönderen: <code>{escape(transaction.from_address)}</code>",
+            ])
+            if transaction.to_address:
+                rows.append(f"📥 Alıcı: <code>{escape(transaction.to_address)}</code>")
+        else:
+            rows.extend([
+                SEPARATOR,
+                f"💠 İşlemdeki ETH değeri: <b>{escape(format_token_amount(transaction.native_value))} <code>ETH</code>{usd_suffix}</b>",
+                "⚠️ İşlem başarısız veya beklemede olduğu için ETH transferi kesinleşmedi.",
+            ])
     visible = list(result.transfers[:5])
     for index, item in enumerate(visible, 1):
         transfer = item.transfer

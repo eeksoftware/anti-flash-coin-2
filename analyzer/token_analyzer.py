@@ -62,21 +62,22 @@ class TokenAnalyzer:
         token_symbol: str = "",
     ) -> TokenAnalysis:
         """Analyze a token address using the exact same registry rules as transfers."""
-        network = network_name.lower()
-        contract = token_address.lower()
+        config = get_network_config(network_name)
+        network = config.name
+        contract = config.normalize_address(token_address)
 
         # Match only exact network + contract deployments. Names and symbols
         # are deliberately not identity checks.
         for symbol, token in self.tokens.get("tokens", {}).items():
             deployment = token.get("networks", {}).get(network, {})
             registered_contract = deployment.get("contract")
-            if isinstance(registered_contract, str) and registered_contract.lower() == contract:
+            if isinstance(registered_contract, str) and config.normalize_address(registered_contract) == contract:
                 return TokenAnalysis("CANONICAL", symbol)
 
         for symbol, networks in self.variants.items():
             for variant in networks.get(network, []):
                 registered_contract = variant.get("contract")
-                if isinstance(registered_contract, str) and registered_contract.lower() == contract:
+                if isinstance(registered_contract, str) and config.normalize_address(registered_contract) == contract:
                     detail = variant.get("classification") or variant.get("status")
                     if isinstance(detail, str):
                         detail = DETAIL_TRANSLATIONS.get(detail.lower(), detail)
@@ -87,7 +88,7 @@ class TokenAnalyzer:
             if (
                 token.get("network", "").lower() == network
                 and isinstance(registered_contract, str)
-                and registered_contract.lower() == contract
+                and config.normalize_address(registered_contract) == contract
             ):
                 return TokenAnalysis(
                     "KNOWN_FRAUD",
@@ -97,7 +98,7 @@ class TokenAnalyzer:
 
         return TokenAnalysis(
             "UNKNOWN",
-            details="Token kayıtlı değil; bu durum tek başına sahte olduğunu göstermez.",
+            details="Token sistemimizde kayıtlı değil; bu durum tek başına sahte olduğunu göstermez. Lütfen sizde manuel olarak kontrol ediniz.",
         )
 
     def _warn_about_incomplete_ethereum_fraud_addresses(self) -> None:
@@ -107,7 +108,7 @@ class TokenAnalyzer:
                 token.get("network", "").lower() == "ethereum"
                 and (
                     not isinstance(contract, str)
-                    or get_network_config("ethereum").address_regex.fullmatch(contract) is None
+                    or not get_network_config("ethereum").is_valid_address(contract)
                 )
             ):
                 logger.warning(

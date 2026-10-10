@@ -403,7 +403,7 @@ def test_check_command_uses_shared_service_in_private_chat():
         "chat": {"id": 321, "type": "private"},
     }))
     assert service.calls == [("ethereum", address)]
-    assert f"<code>{address}</code>" in notifier.sent[0][1].text
+    assert any(f"<code>{address}</code>" in message.text for _, message in notifier.sent)
 
 
 def test_check_menu_waits_for_input_then_edits_prompt_with_result():

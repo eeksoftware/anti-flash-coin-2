@@ -69,8 +69,8 @@ class CheckService:
         note: str | None = None,
     ) -> TokenCheckResult:
         config = get_network_config(network)
-        normalized_address = token_address.lower()
-        if config.address_regex.fullmatch(normalized_address) is None:
+        normalized_address = config.normalize_address(token_address)
+        if not config.is_valid_address(normalized_address):
             raise ValueError("Geçersiz adres")
         key = f"token:{config.name}:{normalized_address}"
         cached = self.cache.get(key)
@@ -107,8 +107,8 @@ class CheckService:
         note: str | None = None,
     ) -> TxCheckResult:
         config = get_network_config(network)
-        normalized_hash = tx_hash.lower()
-        if config.tx_hash_regex.fullmatch(normalized_hash) is None:
+        normalized_hash = config.normalize_tx_hash(tx_hash)
+        if not config.is_valid_tx_hash(tx_hash):
             raise ValueError("Geçersiz işlem hash'i")
         key = f"tx:{config.name}:{normalized_hash}"
         cached = self.cache.get(key)
