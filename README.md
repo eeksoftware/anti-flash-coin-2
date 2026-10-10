@@ -62,6 +62,24 @@ Yanlış alarm oranı `FALSE_POSITIVE / (CORRECT + FALSE_POSITIVE)` değeridir. 
 
 Testler: `.venv/bin/python -m pytest -q`
 
+## Yerel panel
+
+Panel, bu bilgisayarın tarayıcısında açılan salt okunur bir görünümdür. Kayıt silmez, sınıflandırma veya cüzdan ayarı değiştirmez, botu başlatmaz ve blockchain ya da Telegram'a istek atmaz. Adres `http://127.0.0.1:1337` dışına bağlanmaz. API anahtarı, bot tokenı, cüzdan adresi ve kullanıcı kimliği gösterilmez.
+
+Bağımlılık Streamlit'tir. Kurulum:
+
+~~~bash
+.venv/bin/pip install -r requirements.txt
+~~~
+
+Paneli, bot çalışırken ayrı bir terminalde açın:
+
+~~~bash
+.venv/bin/streamlit run dashboard.py --server.address 127.0.0.1 --server.port 1337
+~~~
+
+Bot ayrı komutla başlar: `python3 main.py`. İkisi birbirini başlatmaz. `.streamlit/config.toml` aynı adresi ve portu sabitler. Veri yoksa sayfalar boş durum gösterir; eksik tablo varsa bunu yazar, sıfır uydurmaz.
+
 ## Log formatı
 
 Log dosyaları LOG_DIR altında tutulur; varsayılan konum proje kökündeki logs/ klasörüdür. Klasör ihtiyaç olduğunda oluşturulur. LOG_LEVEL varsayılanı INFO, LOG_RETENTION_DAYS varsayılanı 90 gündür. Dosyalar her gün UTC gece yarısında döner. Gizli anahtarlar mesaj, argüman ve traceback'lerde maskelenir. Dosya yazma hataları uygulamanın çalışmasını durdurmaz.
