@@ -31,6 +31,7 @@ class WalletMonitor:
         on_transfers: Callable[[list[TokenTransfer]], Awaitable[None]] | None = None,
         on_api_status: Callable[[str], Awaitable[None]] | None = None,
         health_state=None,
+        on_baseline: Callable[[list[TokenTransfer]], Awaitable[None]] | None = None,
     ) -> None:
         self.client = client
         self.provider = client if callable(getattr(client, "get_transaction", None)) else None
@@ -43,6 +44,7 @@ class WalletMonitor:
         self.normalizer = normalizer
         self.on_transfers = on_transfers
         self.on_api_status = on_api_status
+        self.on_baseline = on_baseline
         self.health_state = health_state
 
     def set_wallet_address(self, wallet_address: str) -> None:
@@ -132,6 +134,11 @@ class WalletMonitor:
                         "Cüzdan izleme başladı; %d mevcut transfer olayı bulundu.",
                         len(transfers),
                     )
+                    if self.on_baseline is not None:
+                        try:
+                            await self.on_baseline(transfers)
+                        except Exception:
+                            logger.exception("Temel geçmiş işlenemedi.")
                 elif new_transfers:
                     logger.info(
                         "%d yeni token transfer olayı algılandı.",
@@ -186,7 +193,9 @@ class WalletMonitorManager:
         on_transfers: Callable[[WalletSubscription, list[TokenTransfer]], Awaitable[None]],
         on_api_status: Callable[[WalletSubscription, str], Awaitable[None]],
         health_state=None,
+        on_baseline: Callable[[str, str, list[TokenTransfer]], Awaitable[None]] | None = None,
     ) -> None:
+        self.on_baseline = on_baseline
         if isinstance(client, dict):
             self.providers = {str(name).lower(): value for name, value in client.items()}
         else:
@@ -225,6 +234,10 @@ class WalletMonitorManager:
             for subscription in current_subscriptions():
                 await self.on_api_status(subscription, status)
 
+        async def baseline_callback(transfers: list[TokenTransfer]) -> None:
+            if self.on_baseline is not None:
+                await self.on_baseline(network, wallet_address, transfers)
+
         monitor = WalletMonitor(
             client=provider,
             tracker=TransactionTracker(),
@@ -235,6 +248,7 @@ class WalletMonitorManager:
             on_transfers=transfers_callback,
             on_api_status=status_callback,
             health_state=self.health_state,
+            on_baseline=baseline_callback if self.on_baseline is not None else None,
         )
         self._monitors[(network, wallet_address)] = monitor
         if stagger:

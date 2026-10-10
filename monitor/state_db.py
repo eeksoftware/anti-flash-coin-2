@@ -22,10 +22,17 @@ the analyzer result. expected stays limited to gercek, sahte and supheli:
 - FALSE_POSITIVE maps a non-CANONICAL detection to gercek (false alarm).
 - UNSURE does not write a definitive expected label.
 - A manual expected label is never overwritten.
+
+Schema version 2 (stage 7) adds address_history, detections, allowances
+and scan_cursors. detections.event_key matches transfer_feedback.event_key,
+so false-positive feedback can later be joined with the stored signals.
+Approval raw values are stored as decimal strings; SQLite integers are
+too small for uint256.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -41,7 +48,7 @@ from pathlib import Path
 from audit_log import apply_feedback_expected, audit_event_key
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SUSPICIOUS_CLASSIFICATIONS = frozenset({"VARIANT", "KNOWN_FRAUD"})
 FEEDBACK_KINDS = frozenset({"CORRECT", "FALSE_POSITIVE", "UNSURE"})
 _FEEDBACK_CODES = {"c": "CORRECT", "f": "FALSE_POSITIVE", "u": "UNSURE"}
@@ -145,15 +152,21 @@ def skip_notification(
     amount: Decimal,
     prefs: WalletSettings,
     now: datetime,
+    *,
+    extra_suspicious: bool = False,
+    apply_min_amount: bool = True,
 ) -> str | None:
     """Return a skip reason, or None when the existing notification should be sent.
 
     amount is this transfer's own token quantity. It is not compared with
-    another token and it is not converted to USD.
+    another token and it is not converted to USD. extra_suspicious lets a
+    stage 7 finding (lookalike address, high risk) pass the suspicious-only
+    filter without changing the classification. apply_min_amount is False
+    for approval alerts, which carry no transfer amount.
     """
-    if prefs.suspicious_only and classification not in SUSPICIOUS_CLASSIFICATIONS:
+    if prefs.suspicious_only and classification not in SUSPICIOUS_CLASSIFICATIONS and not extra_suspicious:
         return "suspicious_only"
-    if prefs.min_amount > 0 and amount < prefs.min_amount:
+    if apply_min_amount and prefs.min_amount > 0 and amount < prefs.min_amount:
         return "min_amount"
     if quiet_contains(now, prefs.quiet_start, prefs.quiet_end):
         return "quiet_hours"
@@ -241,9 +254,72 @@ def _migration_v1(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_v2(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE address_history (
+            network TEXT NOT NULL,
+            wallet_address TEXT NOT NULL,
+            counterparty TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            transfer_count INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (network, wallet_address, counterparty)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE detections (
+            event_key TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            network TEXT NOT NULL,
+            wallet_address TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            score INTEGER,
+            level TEXT,
+            weights_version TEXT NOT NULL,
+            signals TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (event_key, kind)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE allowances (
+            network TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            spender TEXT NOT NULL,
+            value_raw TEXT NOT NULL,
+            block_number INTEGER NOT NULL,
+            tx_hash TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (network, owner, token_address, spender)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE scan_cursors (
+            network TEXT NOT NULL,
+            wallet_address TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (network, wallet_address, kind)
+        )
+        """
+    )
+
+
+MIGRATIONS: list[tuple[int, object]] = [(1, _migration_v1), (2, _migration_v2)]
+
+
 def migrate(connection: sqlite3.Connection, steps: list[tuple[int, object]] | None = None) -> None:
     """Apply pending schema versions. A failed version rolls back completely."""
-    planned = steps if steps is not None else [(SCHEMA_VERSION, _migration_v1)]
+    planned = steps if steps is not None else MIGRATIONS
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -445,3 +521,115 @@ class UserStateStore:
         except Exception:
             logger.warning("Geri bildirim günlük kaydına yazılamadı.")
         return "updated"
+
+    # --- stage 7: address history -------------------------------------
+
+    def counterparties(self, network: str, wallet_address: str) -> list[str]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT counterparty FROM address_history WHERE network=? AND wallet_address=? ORDER BY first_seen",
+                (network, wallet_address),
+            ).fetchall()
+        return [row["counterparty"] for row in rows]
+
+    def record_counterparties(self, network: str, wallet_address: str, counterparties: list[str] | tuple[str, ...], seen_at: datetime | None = None) -> None:
+        stamp = (seen_at or datetime.now(timezone.utc)).isoformat()
+        with self._lock:
+            self._connection.executemany(
+                """
+                INSERT INTO address_history (network, wallet_address, counterparty, first_seen, last_seen, transfer_count)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(network, wallet_address, counterparty) DO UPDATE SET
+                    last_seen=MAX(last_seen, excluded.last_seen),
+                    transfer_count=transfer_count + 1
+                """,
+                [(network, wallet_address, item, stamp, stamp) for item in counterparties if item and item != wallet_address],
+            )
+            self._connection.commit()
+
+    # --- stage 7: detections -------------------------------------------
+
+    def save_detection(self, *, event_key: str, kind: str, network: str, wallet_address: str, tx_hash: str, score: int | None, level: str | None, weights_version: str, signals: list[dict]) -> bool:
+        """Store a detection once per (event_key, kind). Returns False when it already existed."""
+        with self._lock:
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO detections (event_key, kind, network, wallet_address, tx_hash, score, level, weights_version, signals, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (event_key, kind, network, wallet_address, tx_hash, score, level, weights_version, json.dumps(signals, ensure_ascii=False, separators=(",", ":")), _utc_now()),
+                )
+                self._connection.commit()
+            except sqlite3.IntegrityError:
+                self._connection.rollback()
+                return False
+        return True
+
+    def detection(self, event_key: str, kind: str) -> dict | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM detections WHERE event_key=? AND kind=?",
+                (event_key, kind),
+            ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data["signals"] = json.loads(data["signals"])
+        except (TypeError, json.JSONDecodeError):
+            data["signals"] = []
+        return data
+
+    # --- stage 7: allowances and scan cursors ---------------------------
+
+    def allowance(self, network: str, owner: str, token_address: str, spender: str) -> int | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value_raw FROM allowances WHERE network=? AND owner=? AND token_address=? AND spender=?",
+                (network, owner, token_address, spender),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return int(row["value_raw"])
+        except (TypeError, ValueError):
+            return None
+
+    def save_allowance(self, *, network: str, owner: str, token_address: str, spender: str, value_raw: int, block_number: int, tx_hash: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO allowances (network, owner, token_address, spender, value_raw, block_number, tx_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(network, owner, token_address, spender) DO UPDATE SET
+                    value_raw=excluded.value_raw,
+                    block_number=excluded.block_number,
+                    tx_hash=excluded.tx_hash,
+                    updated_at=excluded.updated_at
+                WHERE excluded.block_number >= allowances.block_number
+                """,
+                (network, owner, token_address, spender, str(value_raw), block_number, tx_hash, _utc_now()),
+            )
+            self._connection.commit()
+
+    def scan_cursor(self, network: str, wallet_address: str, kind: str) -> int | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT position FROM scan_cursors WHERE network=? AND wallet_address=? AND kind=?",
+                (network, wallet_address, kind),
+            ).fetchone()
+        return None if row is None else int(row["position"])
+
+    def save_scan_cursor(self, network: str, wallet_address: str, kind: str, position: int) -> None:
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO scan_cursors (network, wallet_address, kind, position, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(network, wallet_address, kind) DO UPDATE SET
+                    position=excluded.position, updated_at=excluded.updated_at
+                """,
+                (network, wallet_address, kind, int(position), _utc_now()),
+            )
+            self._connection.commit()

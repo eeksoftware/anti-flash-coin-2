@@ -43,6 +43,7 @@ class Settings:
 
     poll_interval: float
     max_poll_interval: float
+    approval_poll_interval: float = 60.0
     log_dir: str = "./logs"
     log_level: str = "INFO"
     log_retention_days: int = 90
@@ -106,6 +107,7 @@ def load_settings() -> Settings:
 
         poll_interval=float(os.getenv("POLL_INTERVAL", "2")),
         max_poll_interval=float(os.getenv("MAX_POLL_INTERVAL", "30")),
+        approval_poll_interval=float(os.getenv("APPROVAL_POLL_INTERVAL", "60")),
         log_dir=os.getenv("LOG_DIR", "./logs"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         log_retention_days=int(os.getenv("LOG_RETENTION_DAYS", "90")),

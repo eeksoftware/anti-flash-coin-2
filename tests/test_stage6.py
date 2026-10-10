@@ -9,6 +9,7 @@ import pytest
 from audit_log import audit_event_key
 from models.transaction import TokenTransfer
 from monitor.state_db import (
+    SCHEMA_VERSION,
     SettingsInputError,
     UserStateStore,
     WalletSettings,
@@ -217,7 +218,7 @@ def test_migration_is_idempotent_and_rolls_back(tmp_path):
     saved.save_settings("7", "ethereum", WALLET, WalletSettings(alias="Duruyor"))
     UserStateStore(path)
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
         assert db.execute("SELECT alias FROM wallet_settings").fetchone()[0] == "Duruyor"
     with sqlite3.connect(legacy) as db:
         assert db.execute("SELECT value FROM sample").fetchone()[0] == "eski"

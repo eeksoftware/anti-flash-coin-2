@@ -184,6 +184,18 @@ def wallet_settings_keyboard(address: str, network: str = "ethereum") -> InlineK
     ])
 
 
+def approval_alert_keyboard(network: str, tx_hash: str, token_address: str, wallet_address: str) -> InlineKeyboard:
+    try:
+        config = get_network_config(network)
+    except ValueError:
+        return inline_keyboard([])
+    return inline_keyboard([[
+        url_button("🔍 İşlemi Aç", config.transaction_url(quote(tx_hash, safe=""))),
+        url_button("📄 Kontratı Aç", config.token_url(quote(token_address, safe=""))),
+        url_button("👛 Cüzdan", config.address_url(quote(wallet_address, safe=""))),
+    ]])
+
+
 def transfer_alert_keyboard(
     network: str,
     tx_hash: str,

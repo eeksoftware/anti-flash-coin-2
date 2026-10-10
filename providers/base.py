@@ -38,6 +38,10 @@ class ContractInfo:
     created_at: datetime | None = None
 
 
+class UnsupportedFeature(NotImplementedError):
+    """A provider does not offer this optional capability on its network."""
+
+
 @runtime_checkable
 class ChainProvider(Protocol):
     network: str
@@ -49,3 +53,18 @@ class ChainProvider(Protocol):
     async def get_transaction_token_transfers(self, tx_hash: str) -> list[TokenTransfer]: ...
 
     async def get_contract_info(self, token_address: str) -> ContractInfo: ...
+
+
+@runtime_checkable
+class ApprovalCapable(Protocol):
+    """Optional capability: ERC-20 Approval events for an owner address.
+
+    Providers without approval data set supports_approvals = False and raise
+    UnsupportedFeature from get_approval_events.
+    """
+
+    supports_approvals: bool
+
+    async def get_latest_block(self) -> int: ...
+
+    async def get_approval_events(self, owner: str, from_block: int, to_block: int) -> list: ...

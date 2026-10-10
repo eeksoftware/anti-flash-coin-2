@@ -25,6 +25,7 @@ import aiohttp
 
 from audit_log import (
     CLASSIFICATION_LABELS,
+    audit_event_key,
     configure_logging,
     flush_logging,
     get_run_id,
@@ -34,12 +35,15 @@ from audit_log import (
     take_interval_counts,
 )
 from health import (GREEN, YELLOW, RED, HealthState, OperationsStore, health_level, write_heartbeat, write_atomic_json)
+from analyzer import address_poisoning
+from analyzer.risk_engine import classification_signals, compute_risk
 from analyzer.token_analyzer import TokenAnalyzer
 from blockchain.etherscan import EtherscanClient
 from blockchain.normalizer import normalize_etherscan_transfers
 from blockchain.token_price import DexScreenerPriceClient
 from config import settings
 from models.transaction import TokenTransfer
+from monitor.approval_monitor import ApprovalMonitor
 from monitor.state_db import SUSPICIOUS_CLASSIFICATIONS, UserStateStore, skip_notification
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore
@@ -289,6 +293,45 @@ async def main() -> None:
                     label,
                 )
 
+                # Stage 7: risk signals sit beside the classification; they never change it.
+                audit_record = {
+                    "network": transfer.network,
+                    "tx_hash": transfer.tx_hash,
+                    "log_index": transfer.log_index,
+                    "event_key": transfer.event_key,
+                    "token_address": transfer.token_address,
+                    "wallet": subscription.wallet_address,
+                }
+                counterparty = transfer.sender if transfer.direction == "RECEIVE" else transfer.receiver
+                poisoning = None
+                if user_state is not None:
+                    try:
+                        known = user_state.counterparties(transfer.network, subscription.wallet_address)
+                        poisoning = address_poisoning.evaluate(
+                            transfer.network, subscription.wallet_address, counterparty,
+                            transfer.amount, known, event_key=transfer.event_key,
+                        )
+                    except Exception:
+                        logger.warning("Adres benzerliği değerlendirilemedi.")
+                risk_signals = classification_signals(analysis, network=transfer.network, event_key=transfer.event_key)
+                if poisoning is not None:
+                    risk_signals.extend(poisoning.signals)
+                    logger.info("Adres benzerliği şüphesi | baş=%d | son=%d", poisoning.similarity.prefix, poisoning.similarity.suffix)
+                risk = compute_risk(risk_signals, missing=("classification",) if analysis is None else ())
+                if user_state is not None:
+                    try:
+                        fresh = user_state.save_detection(
+                            event_key=audit_event_key(audit_record), kind="risk", network=transfer.network,
+                            wallet_address=subscription.wallet_address, tx_hash=transfer.tx_hash,
+                            score=risk.score, level=risk.level, weights_version=risk.weights_version,
+                            signals=[{"name": s.name, "weight": s.weight, "verified": s.verified, "evidence": s.evidence} for s in risk.signals],
+                        )
+                        if fresh:
+                            user_state.record_counterparties(transfer.network, subscription.wallet_address, [counterparty], transfer.timestamp)
+                    except Exception:
+                        logger.warning("Risk tespiti kaydedilemedi.")
+                extra_suspicious = poisoning is not None or risk.level in {"YÜKSEK", "KRİTİK"}
+
                 notified = None
                 telegram_message_id = None
                 notify_error = None
@@ -309,6 +352,7 @@ async def main() -> None:
                             alias = prefs.alias or None
                             reason = skip_notification(
                                 classification, transfer.amount, prefs, datetime.now(timezone.utc),
+                                extra_suspicious=extra_suspicious,
                             )
                             if reason:
                                 send_alert = False
@@ -320,14 +364,7 @@ async def main() -> None:
                                         network=transfer.network,
                                         wallet_address=subscription.wallet_address,
                                         classification=classification,
-                                        record={
-                                            "network": transfer.network,
-                                            "tx_hash": transfer.tx_hash,
-                                            "log_index": transfer.log_index,
-                                            "event_key": transfer.event_key,
-                                            "token_address": transfer.token_address,
-                                            "wallet": subscription.wallet_address,
-                                        },
+                                        record=audit_record,
                                     )
                                 except Exception:
                                     logger.warning("Geri bildirim kaydı oluşturulamadı.")
@@ -339,6 +376,8 @@ async def main() -> None:
                                 chat_id=recipient,
                                 alias=alias,
                                 feedback_token=feedback_token,
+                                risk=risk,
+                                poisoning=poisoning,
                             )
                             notified = True
                             if operations: operations.increment("notifications_sent")
@@ -362,9 +401,7 @@ async def main() -> None:
                     if classification != "CANONICAL"
                     else None
                 )
-                signals = getattr(analysis, "signals", []) if analysis is not None else []
-                if not isinstance(signals, (list, tuple)):
-                    signals = []
+                signals = [signal.name for signal in risk.signals]
                 log_transaction({
                     "ts": recorded_at,
                     "source": "monitor",
@@ -393,6 +430,61 @@ async def main() -> None:
                     "confirmed": transfer.confirmed,
                     "error": analysis_error,
                 })
+
+        async def seed_address_history(network: str, wallet_address: str, transfers: list[TokenTransfer]) -> None:
+            """Baseline transfers fill the counterparty history; they are not alerts."""
+            if user_state is None:
+                return
+            seen = {
+                transfer.sender if transfer.direction == "RECEIVE" else transfer.receiver
+                for transfer in transfers
+            }
+            user_state.record_counterparties(network, wallet_address, sorted(seen))
+
+        async def token_decimals(network: str, token_address: str) -> int | None:
+            provider_for = providers.get(network)
+            if provider_for is None:
+                return None
+            info = await provider_for.get_contract_info(token_address)
+            return info.decimals
+
+        async def handle_approval(subscription, event, assessment, risk) -> None:
+            logger.info(
+                "Approval olayı | durum=%s | skor=%d | seviye=%s",
+                assessment.state, risk.score, risk.level,
+            )
+            if telegram is None:
+                return
+            recipient = subscription.user_id or settings.telegram_chat_id
+            alias = None
+            if subscription.user_id and user_state is not None:
+                try:
+                    prefs = user_state.settings(subscription.user_id, event.network, subscription.wallet_address)
+                except Exception:
+                    prefs = None
+                if prefs is not None:
+                    alias = prefs.alias or None
+                    reason = skip_notification(
+                        "", assessment.human_value or 0, prefs, datetime.now(timezone.utc),
+                        extra_suspicious=risk.score >= 25, apply_min_amount=False,
+                    )
+                    if reason:
+                        logger.info("Approval bildirimi atlandı | neden=%s", reason)
+                        return
+            if not recipient:
+                return
+            symbol = None
+            try:
+                info = await providers[event.network].get_contract_info(event.token_address)
+                symbol = info.symbol
+            except Exception:
+                symbol = None
+            try:
+                await telegram.send_approval_alert(event, assessment, risk, chat_id=recipient, alias=alias, token_symbol=symbol)
+                if operations: operations.increment("notifications_sent")
+            except Exception as exc:
+                if operations: operations.increment("errors")
+                logger.error("Approval bildirimi gönderilemedi: %s", exc)
 
         async def handle_api_status(subscription, status: str) -> None:
             if telegram is None:
@@ -455,7 +547,20 @@ async def main() -> None:
             on_transfers=handle_new_transfers,
             on_api_status=handle_api_status,
             health_state=health_state,
+            on_baseline=seed_address_history if user_state is not None else None,
         )
+        approval_monitor = None
+        if user_state is not None:
+            approval_monitor = ApprovalMonitor(
+                providers, wallet_store, user_state, handle_approval,
+                interval=settings.approval_poll_interval, decimals_lookup=token_decimals,
+            )
+            supported = approval_monitor.supported_networks()
+            if supported:
+                logger.info("Approval izleme etkin | aglar=%s | aralik=%.0fs", ",".join(supported), approval_monitor.interval)
+            else:
+                approval_monitor = None
+                logger.info("Approval izleme için destekli ağ yok.")
 
         telegram_bot = (
             TelegramBotController(
@@ -483,6 +588,8 @@ async def main() -> None:
             operations=operations, version=bot_version, commit=get_git_commit(), data_dir=data_dir, log_dir=log_dir)
         await asyncio.to_thread(write_heartbeat, data_dir, health_state, initial_report["icon"])
         tasks = [asyncio.create_task(monitor.run()), asyncio.create_task(heartbeat())]
+        if approval_monitor is not None:
+            tasks.append(asyncio.create_task(approval_monitor.run()))
         if settings.heartbeat_url:
             tasks.append(asyncio.create_task(external_heartbeat()))
         if telegram_bot is not None:

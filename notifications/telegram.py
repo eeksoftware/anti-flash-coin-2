@@ -55,6 +55,7 @@ from notifications.telegram_formatter import (
     format_status,
     format_token_check,
     format_tx_check,
+    format_approval_alert,
     format_transfer_alert,
     format_wallet_list,
     format_wallet_settings,
@@ -258,9 +259,26 @@ class TelegramNotifier:
         *,
         alias: str | None = None,
         feedback_token: str | None = None,
+        risk=None,
+        poisoning=None,
     ) -> dict[str, Any]:
         return await self.send_formatted(
-            format_transfer_alert(transfer, analysis, alias=alias, feedback_token=feedback_token),
+            format_transfer_alert(transfer, analysis, alias=alias, feedback_token=feedback_token, risk=risk, poisoning=poisoning),
+            chat_id,
+        )
+
+    async def send_approval_alert(
+        self,
+        event,
+        assessment,
+        risk,
+        chat_id: str | int | None = None,
+        *,
+        alias: str | None = None,
+        token_symbol: str | None = None,
+    ) -> dict[str, Any]:
+        return await self.send_formatted(
+            format_approval_alert(event, assessment, risk, alias=alias, token_symbol=token_symbol),
             chat_id,
         )
 

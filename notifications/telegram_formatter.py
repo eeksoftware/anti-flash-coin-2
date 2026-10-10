@@ -11,6 +11,7 @@ from monitor.wallet_store import WalletSubscription
 from networks import get_network_config
 from notifications.telegram_keyboards import (
     InlineKeyboard,
+    approval_alert_keyboard,
     back_to_main_keyboard,
     cancel_keyboard,
     check_result_keyboard,
@@ -370,6 +371,8 @@ def format_transfer_alert(
     *,
     alias: str | None = None,
     feedback_token: str | None = None,
+    risk=None,
+    poisoning=None,
 ) -> FormattedMessage:
     severity, classification = CLASSIFICATION_STYLE.get(
         analysis.classification, ("⚪", "Bilinmeyen token")
@@ -394,6 +397,12 @@ def format_transfer_alert(
         rows.append(f"⚠️ {escape(FRAUD_WARNING)}")
     if analysis.details:
         rows.append(f"ℹ️ Ayrıntı: {escape(analysis.details)}")
+    if poisoning is not None:
+        rows.append(
+            "🎭 Adres benzerliği (şüphe): karşı taraf daha önce etkileşilen "
+            f"<code>{escape(poisoning.known_address)}</code> adresine benziyor. Adresi tam olarak doğrulayın."
+        )
+    rows.extend(_risk_rows(risk))
     rows.extend([
         *_party_rows(transfer),
         f"📄 Token kontratı: <code>{escape(transfer.token_address)}</code>",
@@ -409,6 +418,63 @@ def format_transfer_alert(
             wallet_address,
             feedback_token,
         ),
+    )
+
+
+def _risk_rows(risk) -> list[str]:
+    if risk is None:
+        return []
+    rows = [f"{risk.icon} Risk skoru: <b>{risk.score}/100 · {escape(risk.level)}</b>"]
+    for signal in risk.signals[:3]:
+        marker = "" if signal.verified else " (doğrulanmamış)"
+        rows.append(f"  • {escape(signal.evidence)}{escape(marker)}")
+    if risk.missing:
+        rows.append(f"  • Eksik veri: {escape(', '.join(risk.missing))}")
+    return rows
+
+
+_APPROVAL_STATE_TEXT = {
+    "NEW": "Yeni yetki",
+    "INCREASED": "Yetki artırıldı",
+    "DECREASED": "Yetki azaltıldı",
+    "REVOKED": "Yetki iptal edildi",
+    "UNLIMITED": "Sınırsız yetki",
+}
+
+
+def format_approval_alert(event, assessment, risk, *, alias: str | None = None, token_symbol: str | None = None) -> FormattedMessage:
+    """Approval notice. Informational only: the bot never revokes or signs anything."""
+    config = get_network_config(event.network)
+    state = _APPROVAL_STATE_TEXT.get(assessment.state, assessment.state)
+    if assessment.human_value is not None and assessment.state != "UNLIMITED":
+        amount = escape(format_token_amount(assessment.human_value))
+        if token_symbol:
+            amount += f" <code>{escape(sanitize_token_text(token_symbol))}</code>"
+    elif assessment.state == "UNLIMITED":
+        amount = "sınırsız"
+    else:
+        amount = f"ham değer {escape(str(event.value_raw))} (ondalık bilinmiyor)"
+    rows = [
+        f"{risk.icon} <b>Token Yetkisi · {escape(state)}</b>",
+        SEPARATOR,
+        f"🌐 Ağ: {escape(config.display_name)}",
+        f"👛 Cüzdan: <code>{escape(event.owner)}</code>",
+    ]
+    if alias:
+        rows.append(f"👛 Takma ad: <code>{escape(alias)}</code>")
+    rows.extend([
+        f"🏷️ Harcayıcı: <code>{escape(event.spender)}</code>" + (f" ({escape(assessment.spender_label)})" if assessment.spender_label else ""),
+        f"📄 Token kontratı: <code>{escape(event.token_address)}</code>",
+        f"🪙 Yetki tutarı: <b>{amount}</b>",
+    ])
+    rows.extend(_risk_rows(risk))
+    rows.extend([
+        f"🔗 TXID: <code>{escape(event.tx_hash)}</code>",
+        "ℹ️ Bu bildirim bilgilendirme amaçlıdır; bot yetki iptal etmez ve işlem imzalamaz.",
+    ])
+    return FormattedMessage(
+        "\n".join(rows),
+        reply_markup=approval_alert_keyboard(event.network, event.tx_hash, event.token_address, event.owner),
     )
 
 

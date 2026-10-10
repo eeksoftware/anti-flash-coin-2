@@ -19,7 +19,7 @@ from infra.key_pool import CURRENT_PRIORITY, Outcome, PoolExhausted, RateLimited
 from infra.metrics import APIMetrics
 from models.transaction import TokenTransfer
 from networks import get_network_config
-from providers.base import ContractInfo, TransactionInfo
+from providers.base import ContractInfo, TransactionInfo, UnsupportedFeature
 
 logger = logging.getLogger(__name__)
 TRON = get_network_config("tron")
@@ -46,6 +46,13 @@ class TronGridNetworkError(TronGridError):
 
 class TronProvider:
     network = "tron"
+    supports_approvals = False
+
+    async def get_latest_block(self) -> int:
+        raise UnsupportedFeature("TRON için approval izleme desteklenmiyor.")
+
+    async def get_approval_events(self, owner: str, from_block: int, to_block: int) -> list:
+        raise UnsupportedFeature("TRON için approval izleme desteklenmiyor.")
 
     def __init__(self, *, session: aiohttp.ClientSession | None = None, base_url: str | None = None):
         self.base_url = (base_url or settings.trongrid_base_url).rstrip("/")

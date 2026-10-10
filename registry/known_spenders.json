@@ -1,0 +1,5 @@
+{
+  "_comment": "Approval harcayıcı etiketleri. Her kayıt network, address, label ve doğrulanabilir source alanı taşımalı. Kaynağı olmayan kayıtlar yok sayılır. Bu sürümde doğrulanmış kayıt yoktur.",
+  "risky": [],
+  "trusted": []
+}

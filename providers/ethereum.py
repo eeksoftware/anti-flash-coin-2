@@ -11,6 +11,7 @@ from blockchain.etherscan import EtherscanClient, EtherscanRateLimitError, Ether
 from blockchain.normalizer import normalize_etherscan_transfers
 from models.transaction import TokenTransfer
 from networks import get_network_config
+from analyzer.approvals import APPROVAL_TOPIC, ApprovalEvent, parse_approval_log
 from providers.base import ContractInfo, TransactionInfo
 
 
@@ -20,6 +21,23 @@ _METADATA_TTL_SECONDS = 86400.0
 
 class EthereumProvider:
     network = "ethereum"
+    supports_approvals = True
+
+    async def get_latest_block(self) -> int:
+        return await self.client.get_block_number()
+
+    async def get_approval_events(self, owner: str, from_block: int, to_block: int) -> list[ApprovalEvent]:
+        """Approval logs where the watched wallet is the owner (topic1)."""
+        owner_key = self.config.normalize_address(owner)
+        topic1 = "0x" + owner_key[2:].rjust(64, "0")
+        raw_logs = await self.client.get_logs(from_block=from_block, to_block=to_block, topic0=APPROVAL_TOPIC, topic1=topic1)
+        events = []
+        for raw in raw_logs:
+            event = parse_approval_log(raw, self.network)
+            if event is not None and event.owner == owner_key:
+                events.append(event)
+        events.sort(key=lambda item: (item.block_number, item.log_index))
+        return events
 
     def __init__(self, client: EtherscanClient | None = None) -> None:
         self.client = client or EtherscanClient()

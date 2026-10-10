@@ -227,6 +227,39 @@ class EtherscanClient(BlockchainClient):
         self._raise_api_error(data)
         raise EtherscanError("Etherscan token transfer yanıtı beklenmeyen biçimde.")
 
+    async def get_logs(
+        self,
+        *,
+        from_block: int,
+        to_block: int,
+        topic0: str,
+        topic1: str | None = None,
+        offset: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Return raw event logs filtered by topics (module=logs, action=getLogs)."""
+        params: dict[str, Any] = {
+            "chainid": str(ETHEREUM.chain_id),
+            "module": "logs",
+            "action": "getLogs",
+            "fromBlock": int(from_block),
+            "toBlock": int(to_block),
+            "topic0": topic0,
+            "page": 1,
+            "offset": offset,
+        }
+        if topic1:
+            params["topic1"] = topic1
+            params["topic0_1_opr"] = "and"
+        data = await self._request(params)
+        result = data.get("result")
+        if isinstance(result, list) and all(isinstance(item, dict) for item in result):
+            return result
+        message = f"{data.get('message', '')} {result if isinstance(result, str) else ''}".lower()
+        if "no records found" in message or "no logs found" in message:
+            return []
+        self._raise_api_error(data)
+        raise EtherscanError("Etherscan log yanıtı beklenmeyen biçimde.")
+
     async def _proxy_request(self, action: str, **params: Any) -> Any:
         data = await self._request({
             "chainid": str(ETHEREUM.chain_id),
@@ -321,6 +354,7 @@ def _cache_ttl(params: dict[str, Any], data: dict[str, Any]) -> float:
     action = params.get("action")
     result = data.get("result")
     if data.get("status") == "0" and "no transactions found" in str(result).lower(): return 15.0
+    if action == "getLogs": return 0.0
     if action == "tokentx": return 5.0
     if action in ("getsourcecode", "getcontractcreation"): return 86400.0
     if action == "eth_getTransactionReceipt" and result is None: return 0.0
