@@ -133,6 +133,7 @@ def format_help() -> FormattedMessage:
         "🕘 <b>/history &lt;ağ&gt; &lt;adres&gt;</b> — son 10 ERC-20 transferini göster\n",
         "🔍 <b>/check [ağ] &lt;değer&gt;</b> — token ya da işlem kontrol et\n",
         "📊 <b>/status</b> — izleme durumunu göster\n",
+        "📤 <b>/export</b> — CSV dışa aktar. Örnek: <code>/export 7d</code>\n",
         "⚙️ Cüzdan ayarları, Cüzdanlarım listesindeki Ayarlar düğmesindedir. Saatler UTC'dir.",
     ]
     return FormattedMessage(
@@ -497,11 +498,77 @@ def format_wallet_settings(address: str, network: str, prefs) -> FormattedMessag
         "ℹ️ Şüpheli filtre varyant ve bilinen sahte tokenları bırakır.",
         f"🌙 Sessiz saat: <b>{escape(quiet)}</b>",
         "ℹ️ Saatler UTC'dir. Başlangıç ve bitiş aynıysa filtre kapalıdır.",
+        f"🗓️ Haftalık özet: <b>{'Açık' if prefs.weekly_report else 'Kapalı'}</b>",
+        "ℹ️ Haftalık özet transfer bildiriminden bağımsızdır. Kapalıyken kayıt sürer.",
     ])
     return FormattedMessage(
         _with_separator("⚙️ <b>Cüzdan Ayarları</b>", body),
         reply_markup=wallet_settings_keyboard(address, network),
     )
+
+
+def format_export_prompt() -> FormattedMessage:
+    from notifications.telegram_keyboards import export_keyboard
+
+    body = "\n".join([
+        "Aralık seç veya komut yaz.",
+        "Örnek: <code>/export 7d ethereum VARIANT</code>",
+        "Özel aralık: <code>2026-10-01 2026-10-08</code>",
+        "Bitiş anı dahil değildir. En fazla 366 gün.",
+        "Tespit filtresi: transfer, approval, poisoning.",
+    ])
+    return FormattedMessage(_with_separator("📤 <b>CSV dışa aktarma</b>", body), reply_markup=export_keyboard())
+
+
+def format_export_notice(text: str) -> FormattedMessage:
+    return FormattedMessage(
+        _with_separator("📤 <b>CSV dışa aktarma</b>", escape(text)),
+        reply_markup=back_to_main_keyboard(),
+    )
+
+
+def format_weekly_summary(summary) -> FormattedMessage:
+    from audit_log import CLASSIFICATION_LABELS
+    from reporting.weekly import RISK_LEVELS, change_text
+
+    def feature(value) -> str:
+        return "kayıt yok" if value is None else str(value)
+
+    classes = dict(summary.by_classification)
+    class_line = " · ".join(
+        f"{escape(CLASSIFICATION_LABELS.get(name, name))}: {classes.get(name, 0)}"
+        for name in ("CANONICAL", "VARIANT", "KNOWN_FRAUD", "UNKNOWN", "ERROR")
+    )
+    if summary.by_network:
+        network_line = " · ".join(f"{escape(name)}: {count}" for name, count in summary.by_network)
+    else:
+        network_line = "0"
+    feedback = summary.feedback
+    if summary.risk_levels is None:
+        risk_line = "kayıt yok"
+    else:
+        icons = {"DÜŞÜK": "🟢", "ORTA": "🟡", "YÜKSEK": "🟠", "KRİTİK": "🔴"}
+        levels = dict(summary.risk_levels)
+        risk_line = " · ".join(f"{icons.get(name, '⚪')} {name}: {levels.get(name, 0)}" for name in RISK_LEVELS)
+    body = "\n".join([
+        f"📅 {escape(summary.start.strftime('%Y-%m-%d %H:%M'))} UTC – {escape(summary.end.strftime('%Y-%m-%d %H:%M'))} UTC",
+        "ℹ️ Hafta pazartesi 00:00 UTC başlar. Bitiş anı dahil değildir.",
+        f"🔁 Transfer: <b>{summary.transfers}</b>",
+        f"🌐 {network_line}",
+        f"🛡️ {class_line}",
+        f"🚨 Şüpheli (varyant + bilinen sahte): <b>{summary.suspicious}</b>",
+        f"🎭 Address poisoning: <b>{escape(feature(summary.poisoning))}</b>",
+        f"✅ Approval: <b>{escape(feature(summary.approvals))}</b>",
+        f"📈 Risk: {risk_line}",
+        f"📨 Gönderilen bildirim: <b>{summary.notifications}</b>",
+        f"👍 Doğru: {feedback.get('CORRECT', 0)} · 👎 Yanlış alarm: {feedback.get('FALSE_POSITIVE', 0)} · ❓ Emin değil: {feedback.get('UNSURE', 0)}",
+        f"🏷️ Etiketli örnek: <b>{summary.labeled}</b>",
+        f"📉 Yanlış alarm oranı: <b>{escape(summary.false_alarm)}</b>",
+        f"📊 Önceki haftaya göre transfer: <b>{escape(change_text(summary.transfers, summary.previous_transfers))}</b>",
+        "ℹ️ UNKNOWN sahte sayılmaz. Geri bildirimsiz tespit doğru veya yanlış sayılmaz.",
+        "ℹ️ Oran, etiket yoksa N/A; 5 etiketli örnekten azsa hesaplanmaz.",
+    ])
+    return FormattedMessage(_with_separator("🗓️ <b>Haftalık özet</b>", body))
 
 
 def format_setting_prompt(field: str, network: str) -> FormattedMessage:

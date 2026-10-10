@@ -44,6 +44,7 @@ from blockchain.token_price import DexScreenerPriceClient
 from config import settings
 from models.transaction import TokenTransfer
 from monitor.approval_monitor import ApprovalMonitor
+from reporting.weekly import WeeklyReporter
 from monitor.state_db import SUSPICIOUS_CLASSIFICATIONS, UserStateStore, skip_notification
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore
@@ -430,6 +431,23 @@ async def main() -> None:
                     "confirmed": transfer.confirmed,
                     "error": analysis_error,
                 })
+                if user_state is not None:
+                    try:
+                        user_state.record_report_transfer(
+                            event_key=audit_event_key(audit_record),
+                            network=transfer.network,
+                            wallet_address=subscription.wallet_address,
+                            tx_hash=transfer.tx_hash,
+                            direction=transfer.direction,
+                            token_symbol=transfer.token_symbol,
+                            token_name=transfer.token_name,
+                            amount=format(transfer.amount, "f"),
+                            classification=classification,
+                            block_time=block_time.astimezone(timezone.utc).isoformat(),
+                            notified=notified,
+                        )
+                    except Exception:
+                        logger.warning("Rapor kaydı yazılamadı.")
 
         async def seed_address_history(network: str, wallet_address: str, transfers: list[TokenTransfer]) -> None:
             """Baseline transfers fill the counterparty history; they are not alerts."""
@@ -587,7 +605,10 @@ async def main() -> None:
         initial_report = build_health_report(state=health_state, provider=providers, store=wallet_store,
             operations=operations, version=bot_version, commit=get_git_commit(), data_dir=data_dir, log_dir=log_dir)
         await asyncio.to_thread(write_heartbeat, data_dir, health_state, initial_report["icon"])
+        weekly_reporter = WeeklyReporter(user_state, wallet_store, telegram) if user_state is not None and telegram is not None else None
         tasks = [asyncio.create_task(monitor.run()), asyncio.create_task(heartbeat())]
+        if weekly_reporter is not None:
+            tasks.append(asyncio.create_task(weekly_reporter.run()))
         if approval_monitor is not None:
             tasks.append(asyncio.create_task(approval_monitor.run()))
         if settings.heartbeat_url:

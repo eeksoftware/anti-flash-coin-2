@@ -48,7 +48,7 @@ from pathlib import Path
 from audit_log import apply_feedback_expected, audit_event_key
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SUSPICIOUS_CLASSIFICATIONS = frozenset({"VARIANT", "KNOWN_FRAUD"})
 FEEDBACK_KINDS = frozenset({"CORRECT", "FALSE_POSITIVE", "UNSURE"})
 _FEEDBACK_CODES = {"c": "CORRECT", "f": "FALSE_POSITIVE", "u": "UNSURE"}
@@ -76,6 +76,7 @@ class WalletSettings:
     suspicious_only: bool = False
     quiet_start: str | None = None
     quiet_end: str | None = None
+    weekly_report: bool = False
 
 
 @dataclass(frozen=True)
@@ -314,7 +315,55 @@ def _migration_v2(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: list[tuple[int, object]] = [(1, _migration_v1), (2, _migration_v2)]
+def _migration_v3(connection: sqlite3.Connection) -> None:
+    """Weekly preference, append-only transfer facts, and one-send delivery rows.
+
+    Transfer amount, direction and token text are not in the stage 6 or 7
+    tables. report_transfers records them when a transfer is observed so
+    later reports can read SQLite instead of scanning log files. Wallet
+    addresses stay in the table for authorization and are not exported.
+    """
+    connection.execute(
+        "ALTER TABLE wallet_settings ADD COLUMN weekly_report INTEGER NOT NULL DEFAULT 0"
+    )
+    connection.execute(
+        """
+        CREATE TABLE report_transfers (
+            event_key TEXT PRIMARY KEY,
+            network TEXT NOT NULL,
+            wallet_address TEXT NOT NULL,
+            tx_hash TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            token_symbol TEXT NOT NULL DEFAULT '',
+            token_name TEXT NOT NULL DEFAULT '',
+            amount TEXT NOT NULL,
+            classification TEXT NOT NULL,
+            block_time TEXT NOT NULL,
+            notified INTEGER,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX idx_report_transfers_wallet_time
+        ON report_transfers(network, wallet_address, block_time)
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE weekly_deliveries (
+            user_id TEXT NOT NULL,
+            week_start TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, week_start)
+        )
+        """
+    )
+
+
+MIGRATIONS: list[tuple[int, object]] = [(1, _migration_v1), (2, _migration_v2), (3, _migration_v3)]
 
 
 def migrate(connection: sqlite3.Connection, steps: list[tuple[int, object]] | None = None) -> None:
@@ -371,7 +420,7 @@ class UserStateStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT alias, min_amount, suspicious_only, quiet_start, quiet_end
+                SELECT alias, min_amount, suspicious_only, quiet_start, quiet_end, weekly_report
                 FROM wallet_settings
                 WHERE user_id=? AND network=? AND wallet_address=?
                 """,
@@ -391,6 +440,7 @@ class UserStateStore:
             suspicious_only=bool(row["suspicious_only"]),
             quiet_start=row["quiet_start"],
             quiet_end=row["quiet_end"],
+            weekly_report=bool(row["weekly_report"]),
         )
 
     def save_settings(
@@ -406,14 +456,15 @@ class UserStateStore:
                 """
                 INSERT INTO wallet_settings (
                     user_id, network, wallet_address, alias, min_amount,
-                    suspicious_only, quiet_start, quiet_end
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    suspicious_only, quiet_start, quiet_end, weekly_report
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, network, wallet_address) DO UPDATE SET
                     alias=excluded.alias,
                     min_amount=excluded.min_amount,
                     suspicious_only=excluded.suspicious_only,
                     quiet_start=excluded.quiet_start,
-                    quiet_end=excluded.quiet_end
+                    quiet_end=excluded.quiet_end,
+                    weekly_report=excluded.weekly_report
                 """,
                 (
                     str(user_id),
@@ -424,6 +475,7 @@ class UserStateStore:
                     1 if prefs.suspicious_only else 0,
                     prefs.quiet_start,
                     prefs.quiet_end,
+                    1 if prefs.weekly_report else 0,
                 ),
             )
             self._connection.commit()
@@ -610,6 +662,62 @@ class UserStateStore:
                 WHERE excluded.block_number >= allowances.block_number
                 """,
                 (network, owner, token_address, spender, str(value_raw), block_number, tx_hash, _utc_now()),
+            )
+            self._connection.commit()
+
+    def record_report_transfer(
+        self,
+        *,
+        event_key: str,
+        network: str,
+        wallet_address: str,
+        tx_hash: str,
+        direction: str,
+        token_symbol: str,
+        token_name: str,
+        amount: str,
+        classification: str,
+        block_time: str,
+        notified: bool | None,
+    ) -> None:
+        """Insert one transfer fact. A repeated event key does not create a second row."""
+        notified_value = None if notified is None else (1 if notified else 0)
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO report_transfers (
+                    event_key, network, wallet_address, tx_hash, direction,
+                    token_symbol, token_name, amount, classification,
+                    block_time, notified, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key, network, wallet_address, tx_hash, direction,
+                    token_symbol, token_name, amount, classification,
+                    block_time, notified_value, _utc_now(),
+                ),
+            )
+            self._connection.commit()
+
+    def weekly_delivery_status(self, user_id: str, week_start: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT status FROM weekly_deliveries WHERE user_id=? AND week_start=?",
+                (str(user_id), week_start),
+            ).fetchone()
+        return None if row is None else row["status"]
+
+    def mark_weekly_delivery(self, user_id: str, week_start: str, status: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO weekly_deliveries (user_id, week_start, status, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, week_start) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                """,
+                (str(user_id), week_start, status, _utc_now()),
             )
             self._connection.commit()
 

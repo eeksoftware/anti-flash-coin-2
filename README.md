@@ -50,6 +50,18 @@ Adres zehirlenmesi (address poisoning) tespiti sezgiseldir ve bildirimde "şüph
 
 Approval (ERC-20 `Approval` olayı) izleme yalnızca EVM ağlarında çalışır; TRON sağlayıcısı `supports_approvals=False` döner ve atlanır. Ayrı bir döngü (`APPROVAL_POLL_INTERVAL`, varsayılan 60 sn) her cüzdan için Etherscan `getLogs` ile owner=cüzdan filtresi uygular; ilk turda yalnızca güncel blok imleci kaydedilir, geçmiş yetkiler bildirilmez. Durumlar: `NEW`, `INCREASED`, `DECREASED`, `REVOKED`, `UNLIMITED` (ham değer ≥ 2^255). Sinyaller: `unlimited_allowance` 30, `large_allowance` 15 (yalnızca ondalık biliniyorsa ve ≥1.000.000 token), `allowance_increase` 10, `new_allowance` 5, `known_fraud_spender` 60 (harcayıcı `known_fraud_tokens.json` içinde), `listed_risky_spender` 40 (`registry/known_spenders.json`, yalnızca `source` alanı olan kayıtlar). Bu dosya başlangıçta boştur; kaynaksız adres eklenmez. Büyük bir allowance tek başına dolandırıcılık sayılmaz. Approval bildirimi bilgilendirme amaçlıdır: bot yetki iptal etmez, işlem imzalamaz, özel anahtar istemez. Approval olayı transfer değildir; `transactions.log` ve karışıklık matrisine yazılmaz, `detections` tablosuna `kind=approval` olarak kaydedilir. Kullanıcı ayarlarından sessiz saat uygulanır, minimum tutar uygulanmaz; "yalnızca şüpheli" açıkken skor ≥25 olan approval'lar gönderilir.
 
+## CSV dışa aktarma ve haftalık özet
+
+`/export` yalnızca oturum sahibinin izlediği cüzdanları okur. Parametresiz kullanım aralık düğmelerini açar. Aralıklar: `24h`, `7d`, `30d` veya `YYYY-AA-GG YYYY-AA-GG`. Bitiş anı dahil değildir; özel aralıkta bitiş gününün 00:00 UTC'si dışarıdadır. Aralık en fazla 366 gündür. İsteğe bağlı filtreler: ağ (`ethereum`, `tron`), sınıflandırma (`CANONICAL`, `VARIANT`, `KNOWN_FRAUD`, `UNKNOWN`, `ERROR`) ve tespit türü (`transfer`, `approval`, `poisoning`). Örnek: `/export 7d ethereum VARIANT`.
+
+CSV UTF-8 (BOM'lu) üretilir. Sütunlar: `time_utc`, `network`, `tx_hash`, `direction`, `token_name`, `token_symbol`, `amount`, `classification`, `detection_kind`, `risk_score`, `risk_level`, `feedback`, `notified`. Tutar `Decimal` metnidir ve formül korumasıyla tırnaklanmaz. `=`, `+`, `-`, `@` ile başlayan metin hücrelerinin başına `'` konur. Cüzdan adresi, kullanıcı kimliği ve API anahtarı sütun değildir. Dosya adı yalnızca tarihlerden oluşur (`aft-export-YYYYMMDD-YYYYMMDD.csv`). Kayıt yoksa dosya gönderilmez. 20.000 satır veya 8 MB aşılırsa dosya silinir ve aralığın daraltılması istenir. Gönderim hatasında geçici dosya silinir.
+
+Haftalık özet pazartesi 00:00 UTC ile sonraki pazartesi 00:00 UTC arasını kapsar ve yalnızca yeni kapanan haftayı, kullanıcı başına bir kez gönderir. Bot kapalıyken kaçan eski haftalar art arda gönderilmez. Sessiz saate denk gelirse o tur atlanır, izleme durmaz. Ayar, cüzdan ayarlarındaki "Haftalık özet" düğmesidir; varsayılan kapalıdır. Kapatmak transfer kaydını durdurmaz.
+
+Yanlış alarm oranı `FALSE_POSITIVE / (CORRECT + FALSE_POSITIVE)` değeridir. `UNSURE` ve geri bildirimsiz tespitler paydaya girmez. Etiket yoksa oran `N/A`, 5 etiketli örnekten azsa `Yeterli etiketli veri yok` yazılır. `UNKNOWN`, bilinen sahte sayısına eklenmez. Önceki haftadan önce kayıt yoksa değişim `N/A` olur. `stats_daily` genel sayaçtır; kişisel özete karıştırılmaz. `expected` SQLite'ta tutulmaz, log taranmaz.
+
+Testler: `.venv/bin/python -m pytest -q`
+
 ## Log formatı
 
 Log dosyaları LOG_DIR altında tutulur; varsayılan konum proje kökündeki logs/ klasörüdür. Klasör ihtiyaç olduğunda oluşturulur. LOG_LEVEL varsayılanı INFO, LOG_RETENTION_DAYS varsayılanı 90 gündür. Dosyalar her gün UTC gece yarısında döner. Gizli anahtarlar mesaj, argüman ve traceback'lerde maskelenir. Dosya yazma hataları uygulamanın çalışmasını durdurmaz.

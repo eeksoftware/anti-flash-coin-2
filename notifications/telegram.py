@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -27,6 +29,16 @@ from monitor.state_db import (
     parse_quiet_hours,
 )
 from monitor.wallet_monitor import WalletMonitorManager
+from reporting.access import (
+    ExportTooLarge,
+    InvalidRange,
+    ReportError,
+    ReportReader,
+    UnauthorizedWallet,
+    export_filename,
+    parse_export_args,
+    write_csv,
+)
 from monitor.wallet_store import WalletStateStore, WalletSubscription
 from notifications.telegram_formatter import (
     FormattedMessage,
@@ -41,6 +53,8 @@ from notifications.telegram_formatter import (
     format_add_prompt,
     format_api_status,
     format_error,
+    format_export_notice,
+    format_export_prompt,
     format_group_start,
     format_help,
     format_history,
@@ -89,6 +103,11 @@ from notifications.telegram_keyboards import (
     WALLET_REMOVE_PREFIX,
     WALLET_SETTINGS_PREFIX,
     WALLET_SUSPICIOUS_PREFIX,
+    WALLET_WEEKLY_PREFIX,
+    EXPORT_24H,
+    EXPORT_7D,
+    EXPORT_30D,
+    EXPORT_CUSTOM,
     cancel_keyboard,
     history_result_keyboard,
     main_menu_keyboard,
@@ -130,6 +149,13 @@ class PendingSetting:
     network: str
     address: str
     field: str
+    chat_id: str
+    message_id: int
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class PendingExport:
     chat_id: str
     message_id: int
     expires_at: float
@@ -217,6 +243,33 @@ class TelegramNotifier:
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         await self.call_api("sendMessage", payload)
+        if self.health_state is not None:
+            self.health_state.last_telegram_success_at = datetime.now(timezone.utc)
+
+    async def send_document(self, chat_id: str | int, path, filename: str, caption: str = "") -> None:
+        session = await self._ensure_session()
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if caption:
+            form.add_field("caption", caption)
+        handle = path.open("rb")
+        form.add_field("document", handle, filename=filename, content_type="text/csv")
+        try:
+            async with session.post(
+                f"{self.BASE_URL}/bot{self.bot_token}/sendDocument",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as response:
+                try:
+                    data = await response.json(content_type=None)
+                except (aiohttp.ClientError, ValueError) as exc:
+                    raise TelegramError("Dosya gönderilemedi.") from exc
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise TelegramError("Dosya gönderilemedi.") from exc
+        finally:
+            handle.close()
+        if not isinstance(data, dict) or not data.get("ok"):
+            raise TelegramError("Dosya gönderilemedi.")
         if self.health_state is not None:
             self.health_state.last_telegram_success_at = datetime.now(timezone.utc)
 
@@ -336,6 +389,7 @@ class TelegramBotController:
         self._pending_addresses: dict[str, PendingAddress] = {}
         self._pending_checks: dict[str, PendingCheck] = {}
         self._pending_settings: dict[str, PendingSetting] = {}
+        self._pending_exports: dict[str, PendingExport] = {}
         self._check_rate_limiter = CheckRateLimiter()
 
     async def run(self) -> None:
@@ -377,6 +431,7 @@ class TelegramBotController:
             {"command": "check", "description": "Token ya da işlem kontrol et"},
             {"command": "status", "description": "İzleme durumunu göster"},
             {"command": "help", "description": "Yardım menüsünü aç"},
+            {"command": "export", "description": "Transferleri CSV olarak indir"},
         ]
         setup_calls = [
             (
@@ -479,6 +534,7 @@ class TelegramBotController:
             self._pending_addresses.pop(user_id, None)
             self._pending_checks.pop(user_id, None)
             self._pending_settings.pop(user_id, None)
+            self._pending_exports.pop(user_id, None)
             await self._send(
                 chat_id,
                 format_start(
@@ -505,6 +561,15 @@ class TelegramBotController:
         if pending_check is not None and time.monotonic() >= pending_check.expires_at:
             self._pending_checks.pop(user_id, None)
             await self._edit(pending_check.chat_id, pending_check.message_id, format_check_error("expired"))
+
+        pending_export = self._pending_exports.get(user_id)
+        if pending_export is not None and not command.startswith("/"):
+            self._pending_exports.pop(user_id, None)
+            if time.monotonic() >= pending_export.expires_at:
+                await self._edit(pending_export.chat_id, pending_export.message_id, format_add_expired())
+                return
+            await self._run_export(user_id, chat_id, text.strip().split(), pending_export.message_id)
+            return
 
         pending_setting = self._pending_settings.get(user_id)
         if pending_setting is not None and not command.startswith("/"):
@@ -535,6 +600,12 @@ class TelegramBotController:
             await self._handle_history_command(parts, chat_id, sender)
         elif command == "/check":
             await self._handle_check(parts[1:], user_id, chat_id, sender=sender)
+        elif command == "/export":
+            self._pending_exports.pop(user_id, None)
+            if len(parts) == 1:
+                await self._send(chat_id, format_export_prompt())
+            else:
+                await self._run_export(user_id, chat_id, parts[1:])
         else:
             logger.info("Bilinmeyen Telegram komutu yok sayıldı.")
 
@@ -579,6 +650,58 @@ class TelegramBotController:
             ),
             source_chat_id=chat_id,
         )
+
+    async def _run_export(self, user_id: str, chat_id: str, parts: list[str], message_id: int | None = None) -> None:
+        async def tell(text: str) -> None:
+            message = format_export_notice(text)
+            try:
+                if message_id is None:
+                    await self._send(chat_id, message)
+                else:
+                    await self._edit(chat_id, message_id, message)
+            except (TelegramError, OSError):
+                logger.warning("CSV sonucu iletilemedi.")
+
+        if self.user_state is None:
+            await tell("Raporlar şu an kullanılamıyor. İzleme sürüyor.")
+            return
+        try:
+            request = parse_export_args(parts)
+        except InvalidRange as exc:
+            await tell(str(exc))
+            return
+        allowed = [(item.network, item.wallet_address) for item in self.wallet_store.for_user(user_id)]
+        operations = getattr(self.operations_store, "path", None)
+        reader = ReportReader(self.user_state.path, operations)
+        path: Path | None = None
+        try:
+            rows = reader.iter_rows(
+                user_id=user_id,
+                allowed=allowed,
+                period=request.period,
+                network=request.network,
+                classification=request.classification,
+                detection=request.detection,
+                wallet=request.wallet,
+            )
+            path, count = write_csv(rows, Path(tempfile.gettempdir()))
+            if count == 0:
+                await tell("Bu aralıkta kayıt yok.")
+                return
+            caption = f"CSV · {request.period.start:%Y-%m-%d} – {request.period.end:%Y-%m-%d} UTC"
+            await self.notifier.send_document(chat_id, path, export_filename(request.period), caption)
+            if message_id is not None:
+                await self._edit(chat_id, message_id, format_export_notice("Dosya gönderildi."))
+        except UnauthorizedWallet as exc:
+            await tell(str(exc))
+        except ExportTooLarge as exc:
+            await tell(str(exc))
+        except (ReportError, TelegramError, OSError):
+            logger.warning("CSV dışa aktarma başarısız.")
+            await tell("Rapor oluşturulamadı. İzleme sürüyor.")
+        finally:
+            if path is not None:
+                path.unlink(missing_ok=True)
 
     async def _handle_watch_command(
         self,
@@ -774,6 +897,16 @@ class TelegramBotController:
         sender: dict[str, Any],
     ) -> None:
         wallets = self.wallet_store.for_user(user_id)
+        export_args = {EXPORT_24H: "24h", EXPORT_7D: "7d", EXPORT_30D: "30d"}
+        if data in export_args:
+            await self._run_export(user_id, chat_id, [export_args[data]], message_id)
+            return
+        if data == EXPORT_CUSTOM:
+            self._pending_exports[user_id] = PendingExport(
+                chat_id, message_id, time.monotonic() + self.PENDING_ADDRESS_TTL,
+            )
+            await self._edit(chat_id, message_id, format_export_prompt())
+            return
         if data == MENU_MAIN:
             await self._edit(chat_id, message_id, format_start(
                 self.bot_name,
@@ -821,6 +954,7 @@ class TelegramBotController:
             self._pending_addresses.pop(user_id, None)
             self._pending_checks.pop(user_id, None)
             self._pending_settings.pop(user_id, None)
+            self._pending_exports.pop(user_id, None)
             await self._edit(chat_id, message_id, format_start(
                 self.bot_name,
                 str(sender.get("first_name") or "kullanıcı"),
@@ -1008,6 +1142,7 @@ class TelegramBotController:
             WALLET_SUSPICIOUS_PREFIX,
             WALLET_QUIET_PREFIX,
             WALLET_QUIET_CLEAR_PREFIX,
+            WALLET_WEEKLY_PREFIX,
         ))
 
     async def _handle_settings_callback(self, data, user_id, chat_id, message_id, wallets) -> None:
@@ -1022,6 +1157,8 @@ class TelegramBotController:
             prefix, field = WALLET_SUSPICIOUS_PREFIX, "suspicious"
         elif data.startswith(WALLET_QUIET_CLEAR_PREFIX):
             prefix, field = WALLET_QUIET_CLEAR_PREFIX, "quiet_clear"
+        elif data.startswith(WALLET_WEEKLY_PREFIX):
+            prefix, field = WALLET_WEEKLY_PREFIX, "weekly"
         elif data.startswith(WALLET_QUIET_PREFIX):
             prefix, field = WALLET_QUIET_PREFIX, "quiet"
         else:
@@ -1057,6 +1194,8 @@ class TelegramBotController:
         from dataclasses import replace
         if field == "suspicious":
             updated = replace(prefs, suspicious_only=not prefs.suspicious_only)
+        elif field == "weekly":
+            updated = replace(prefs, weekly_report=not prefs.weekly_report)
         else:
             updated = replace(prefs, quiet_start=None, quiet_end=None)
         try:

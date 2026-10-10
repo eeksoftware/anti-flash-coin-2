@@ -36,6 +36,11 @@ WALLET_MIN_PREFIX = "w:mn:"
 WALLET_SUSPICIOUS_PREFIX = "w:so:"
 WALLET_QUIET_PREFIX = "w:qh:"
 WALLET_QUIET_CLEAR_PREFIX = "w:qc:"
+WALLET_WEEKLY_PREFIX = "w:wr:"
+EXPORT_24H = "export:24h"
+EXPORT_7D = "export:7d"
+EXPORT_30D = "export:30d"
+EXPORT_CUSTOM = "export:custom"
 
 
 InlineKeyboard = dict[str, list[list[dict[str, Any]]]]
@@ -180,7 +185,16 @@ def wallet_settings_keyboard(address: str, network: str = "ethereum") -> InlineK
             callback_button("🌙 Sessiz saat", f"{WALLET_QUIET_PREFIX}{value}"),
             callback_button("🔔 Sessizi kapat", f"{WALLET_QUIET_CLEAR_PREFIX}{value}"),
         ],
+        [callback_button("🗓️ Haftalık özet", f"{WALLET_WEEKLY_PREFIX}{value}")],
         [callback_button("⬅️ Cüzdanlarım", MENU_WALLETS)],
+    ])
+
+
+def export_keyboard() -> InlineKeyboard:
+    return inline_keyboard([
+        [callback_button("Son 24 saat", EXPORT_24H), callback_button("Son 7 gün", EXPORT_7D)],
+        [callback_button("Son 30 gün", EXPORT_30D), callback_button("Özel aralık", EXPORT_CUSTOM)],
+        [callback_button("⬅️ Ana Menü", MENU_MAIN)],
     ])
 
 

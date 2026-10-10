@@ -340,7 +340,7 @@ def test_migration_v2_tables_and_detection_join(tmp_path):
     with sqlite3.connect(path) as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"address_history", "detections", "allowances", "scan_cursors", "transfer_feedback", "wallet_settings"} <= tables
-        assert [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2]
+        assert [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3]
         joined = db.execute(
             "SELECT d.score, f.token FROM detections d JOIN transfer_feedback f ON f.event_key = d.event_key"
         ).fetchone()
