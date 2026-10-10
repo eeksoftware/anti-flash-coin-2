@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from version import get_version
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SAFE_CLASSIFICATION = "CANONICAL"
@@ -502,6 +504,7 @@ def _transaction_payload(record: dict[str, Any]) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ts": _timestamp(record.get("ts")),
         "run_id": _safe_text(record.get("run_id", get_run_id()), 32),
+        "bot_version": _safe_text(record.get("bot_version", get_version()), 80),
         "source": _safe_text(record.get("source", "monitor"), 16),
         "network": _safe_text(record.get("network", ""), 32),
         "tx_hash": _safe_text(record.get("tx_hash", ""), 160),
@@ -555,6 +558,7 @@ def log_test_event(record: dict[str, Any]) -> bool:
         payload = {key: _safe_text(value, 2000) if isinstance(value, str) else value for key, value in record.items()}
         payload.setdefault("ts", _timestamp())
         payload.setdefault("run_id", get_run_id())
+        payload.setdefault("bot_version", get_version())
         logging.getLogger("audit.tests").info(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return True
     except Exception:

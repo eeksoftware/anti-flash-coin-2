@@ -1,6 +1,8 @@
 from typing import Any
 from urllib.parse import quote
 
+from networks import get_network_config
+
 
 NETWORKS = {
     "ethereum": "🔷 Ethereum",
@@ -137,11 +139,12 @@ def remove_confirmation_keyboard(address: str) -> InlineKeyboard:
 
 
 def transfer_alert_keyboard(network: str, tx_hash: str, token_address: str, wallet_address: str) -> InlineKeyboard:
-    explorer = NETWORK_EXPLORERS.get(network.lower())
-    if explorer is None:
+    try:
+        config = get_network_config(network)
+    except ValueError:
         return inline_keyboard([])
     return inline_keyboard([[
-        url_button("🔍 İşlemi Aç", f"{explorer}/tx/{quote(tx_hash, safe='')}"),
-        url_button("📄 Kontratı Aç", f"{explorer}/token/{quote(token_address, safe='')}"),
-        url_button("👛 Cüzdan", f"{explorer}/address/{quote(wallet_address, safe='')}"),
+        url_button("🔍 İşlemi Aç", config.transaction_url(quote(tx_hash, safe=""))),
+        url_button("📄 Kontratı Aç", config.token_url(quote(token_address, safe=""))),
+        url_button("👛 Cüzdan", config.address_url(quote(wallet_address, safe=""))),
     ]])

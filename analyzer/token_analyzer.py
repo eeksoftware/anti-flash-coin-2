@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 from models.transaction import TokenTransfer
+from networks import get_network_config
 
 
 TokenClassification = Literal["CANONICAL", "VARIANT", "KNOWN_FRAUD", "UNKNOWN"]
@@ -48,8 +49,21 @@ class TokenAnalyzer:
         return data
 
     def analyze(self, transfer: TokenTransfer) -> TokenAnalysis:
-        network = transfer.network.lower()
-        contract = transfer.token_address.lower()
+        return self.analyze_token(
+            transfer.network,
+            transfer.token_address,
+            transfer.token_symbol,
+        )
+
+    def analyze_token(
+        self,
+        network_name: str,
+        token_address: str,
+        token_symbol: str = "",
+    ) -> TokenAnalysis:
+        """Analyze a token address using the exact same registry rules as transfers."""
+        network = network_name.lower()
+        contract = token_address.lower()
 
         # Match only exact network + contract deployments. Names and symbols
         # are deliberately not identity checks.
@@ -77,7 +91,7 @@ class TokenAnalyzer:
             ):
                 return TokenAnalysis(
                     "KNOWN_FRAUD",
-                    token.get("impersonates") or transfer.token_symbol,
+                    token.get("impersonates") or token_symbol,
                     token.get("reason"),
                 )
 
@@ -93,7 +107,7 @@ class TokenAnalyzer:
                 token.get("network", "").lower() == "ethereum"
                 and (
                     not isinstance(contract, str)
-                    or re.fullmatch(r"0x[a-fA-F0-9]{40}", contract) is None
+                    or get_network_config("ethereum").address_regex.fullmatch(contract) is None
                 )
             ):
                 logger.warning(

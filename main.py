@@ -39,6 +39,8 @@ from notifications.telegram import (
     TelegramError,
     TelegramNotifier,
 )
+from providers.ethereum import EthereumProvider
+from version import get_git_commit, get_version
 
 
 async def main() -> None:
@@ -49,7 +51,12 @@ async def main() -> None:
     )
     logger = logging.getLogger(__name__)
     started_at = time.monotonic()
-    logger.info("Bot başlatıldı | run_id=%s", get_run_id())
+    logger.info(
+        "Bot başlatıldı | sürüm=%s | git_commit=%s | run_id=%s",
+        get_version(),
+        get_git_commit(),
+        get_run_id(),
+    )
 
     try:
         if settings.network != "ethereum":
@@ -67,6 +74,7 @@ async def main() -> None:
         )
 
         client = EtherscanClient()
+        provider = EthereumProvider(client)
         price_client = DexScreenerPriceClient()
         token_analyzer = TokenAnalyzer()
         telegram = None
@@ -183,8 +191,9 @@ async def main() -> None:
                 })
                 observed, errors = take_interval_counts()
                 logger.info(
-                    "Heartbeat | run_id=%s | izlenen_cuzdan=%d | gozlenen_transfer=%d | hata=%d | uptime_s=%.0f",
-                    get_run_id(),
+                "Heartbeat | bot_version=%s | run_id=%s | izlenen_cuzdan=%d | gozlenen_transfer=%d | hata=%d | uptime_s=%.0f",
+                get_version(),
+                get_run_id(),
                     wallet_count,
                     observed,
                     errors,
@@ -192,7 +201,7 @@ async def main() -> None:
                 )
 
         monitor = WalletMonitorManager(
-            client=client,
+            client=provider,
             store=wallet_store,
             poll_interval=settings.poll_interval,
             max_poll_interval=settings.max_poll_interval,
@@ -223,7 +232,7 @@ async def main() -> None:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            await client.close()
+            await provider.close()
             await price_client.close()
             if telegram is not None:
                 await telegram.close()

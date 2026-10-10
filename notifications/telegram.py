@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +9,7 @@ import aiohttp
 from analyzer.token_analyzer import TokenAnalysis
 from blockchain.token_price import DexScreenerPriceClient
 from models.transaction import TokenTransfer
+from networks import get_network_config
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore, WalletSubscription
 from notifications.telegram_formatter import (
@@ -203,7 +203,7 @@ class TelegramNotifier:
 
 
 class TelegramBotController:
-    WALLET_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+    WALLET_ADDRESS_RE = get_network_config("ethereum").address_regex
     LONG_POLL_SECONDS = 25
     PAGE_SIZE = 8
     PENDING_ADDRESS_TTL = 5 * 60

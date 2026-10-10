@@ -8,6 +8,7 @@ from blockchain.base import BlockchainClient, BlockchainClientError
 from models.transaction import TokenTransfer
 from monitor.transaction_tracker import TransactionTracker
 from monitor.wallet_store import WalletStateStore, WalletSubscription
+from providers.base import ChainProvider
 
 
 logger = logging.getLogger(__name__)
@@ -19,16 +20,17 @@ class WalletMonitor:
 
     def __init__(
         self,
-        client: BlockchainClient,
+        client: BlockchainClient | ChainProvider,
         tracker: TransactionTracker,
         wallet_address: str,
         poll_interval: float,
         max_poll_interval: float,
-        normalizer: Callable[[list[dict[str, Any]], str], list[TokenTransfer]],
+        normalizer: Callable[[list[dict[str, Any]], str], list[TokenTransfer]] | None = None,
         on_transfers: Callable[[list[TokenTransfer]], Awaitable[None]] | None = None,
         on_api_status: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.client = client
+        self.provider = client if callable(getattr(client, "get_transaction", None)) else None
         self.tracker = tracker
         self.wallet_address = wallet_address
         self._wallet_version = 0
@@ -69,15 +71,25 @@ class WalletMonitor:
                 transfers: list[TokenTransfer] = []
                 page = 1
                 while True:
-                    raw_transfers = await self.client.get_token_transfers(
-                        requested_wallet,
-                        page=page,
-                        offset=self.PAGE_SIZE,
-                    )
-                    page_transfers = self.normalizer(
-                        raw_transfers,
-                        requested_wallet,
-                    )
+                    if self.provider is not None:
+                        get_page = getattr(self.provider, "get_token_transfer_page", None)
+                        if callable(get_page):
+                            page_transfers = await get_page(requested_wallet, page, self.PAGE_SIZE)
+                        elif page == 1:
+                            page_transfers = await self.provider.get_token_transfers(
+                                requested_wallet, self.PAGE_SIZE
+                            )
+                        else:
+                            break
+                    else:
+                        if self.normalizer is None:
+                            raise ValueError("Ham transfer normalizer yapılandırılmamış.")
+                        raw_transfers = await self.client.get_token_transfers(
+                            requested_wallet,
+                            page=page,
+                            offset=self.PAGE_SIZE,
+                        )
+                        page_transfers = self.normalizer(raw_transfers, requested_wallet)
                     transfers.extend(page_transfers)
 
                     # tokentx sorts newest first. Once a page overlaps events
@@ -155,15 +167,16 @@ class WalletMonitorManager:
 
     def __init__(
         self,
-        client: BlockchainClient,
+        client: BlockchainClient | ChainProvider,
         store: WalletStateStore,
         poll_interval: float,
         max_poll_interval: float,
-        normalizer: Callable[[list[dict[str, Any]], str], list[TokenTransfer]],
+        normalizer: Callable[[list[dict[str, Any]], str], list[TokenTransfer]] | None,
         on_transfers: Callable[[WalletSubscription, list[TokenTransfer]], Awaitable[None]],
         on_api_status: Callable[[WalletSubscription, str], Awaitable[None]],
     ) -> None:
         self.client = client
+        self.provider = client if callable(getattr(client, "get_transaction", None)) else None
         self.store = store
         self.poll_interval = poll_interval
         self.max_poll_interval = max_poll_interval
@@ -234,6 +247,10 @@ class WalletMonitorManager:
     ) -> list[TokenTransfer]:
         if network.lower() != "ethereum":
             raise ValueError("Şu anda yalnızca ethereum ağı destekleniyor.")
+        if self.provider is not None:
+            return (await self.provider.get_token_transfers(wallet_address, limit))[:limit]
+        if self.normalizer is None:
+            raise ValueError("Ham transfer normalizer yapılandırılmamış.")
         raw = await self.client.get_token_transfers(
             wallet_address, page=1, offset=limit
         )

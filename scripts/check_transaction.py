@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import logging
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -30,11 +29,13 @@ from audit_log import (
 from blockchain.etherscan import EtherscanClient
 from blockchain.normalizer import normalize_etherscan_transfers
 from config import settings
+from networks import get_network_config
 from notifications.telegram_formatter import sanitize_token_text
 
 
-ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
-TX_HASH_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
+ETHEREUM = get_network_config("ethereum")
+ADDRESS_RE = ETHEREUM.address_regex
+TX_HASH_RE = ETHEREUM.tx_hash_regex
 PAGE_SIZE = 100
 MAX_PAGES = 100
 

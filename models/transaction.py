@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Literal
 
 
-Direction = Literal["RECEIVE", "SEND"]
+Direction = Literal["RECEIVE", "SEND", "UNKNOWN"]
 
 
 @dataclass(frozen=True)

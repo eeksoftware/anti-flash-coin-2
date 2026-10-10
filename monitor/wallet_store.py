@@ -1,12 +1,13 @@
 import json
 import os
-import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from networks import get_network_config
 
-WALLET_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+WALLET_ADDRESS_RE = get_network_config("ethereum").address_regex
 
 
 @dataclass(frozen=True)
