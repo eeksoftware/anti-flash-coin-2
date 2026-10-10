@@ -1,0 +1,40 @@
+{
+  "known_fraud_tokens": [
+    {
+      "network": "ethereum",
+      "contract": "0x0755BF4a88cf59adEd7f8800Ef34CcA8a8105Cfe",
+      "symbol": "USD𝖳",
+      "name": "USD𝖳-ERC20",
+      "impersonates": "USDT",
+      "classification": "token_impersonation",
+      "risk": "critical",
+      "reason": "Kanonik olmayan bir Ethereum sözleşmesi kullanarak Tether USD (USDT) taklidi yapıyor.",
+      "canonical_contract": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "source_type": "public_token_tracker_report"
+    },
+    {
+      "network": "ethereum",
+      "contract": "0x1395...9008",
+      "symbol": "USDT",
+      "name": "Tether USD",
+      "impersonates": "USDT",
+      "classification": "token_impersonation",
+      "risk": "critical",
+      "reason": "Sahte Tether USD tokenı olarak bildirilmiş. Sözleşme kanonik Tether USDT sözleşmesi değil ve honeypot/şüpheli sahip davranışıyla ilişkilendirilmiş.",
+      "canonical_contract": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "source_type": "high_risk_token_report"
+    },
+    {
+      "network": "bsc",
+      "contract": "0x63b7e5ae00cc6053358fb9b97b361372fba10a5e",
+      "symbol": "USDT",
+      "name": "Tether USD",
+      "impersonates": "USDT",
+      "classification": "suspicious_token",
+      "risk": "high",
+      "reason": "BscScan tarafından şüpheli bir token temsili olarak bildirilmiş.",
+      "canonical_contract": "0x55d398326f99059fF775485246999027B3197955",
+      "source_type": "blockchain_explorer_report"
+    }
+  ]
+}

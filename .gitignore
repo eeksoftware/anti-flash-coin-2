@@ -1,0 +1,7 @@
+logs/
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+runtime_state.json

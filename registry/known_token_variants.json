@@ -1,0 +1,206 @@
+{
+  "USDC": {
+    "arbitrum": [
+      {
+        "contract": "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+        "symbol": "USDC.e",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+      }
+    ],
+    "avalanche": [
+      {
+        "contract": "0xA7D7079b0FEaD91F3e65f86E8915Cb59c1a4C664",
+        "symbol": "USDC.e",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"
+      }
+    ],
+    "base": [
+      {
+        "contract": "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",
+        "symbol": "USDbC",
+        "name": "USD Base Coin",
+        "classification": "legacy",
+        "status": "deprecated",
+        "canonical_contract": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      }
+    ],
+    "near": [
+      {
+        "contract": "a0b86991c6218b36c1d19d4a2e9eb0ce3606eB48.factory.bridge.near",
+        "symbol": "USDC.e",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
+      }
+    ],
+    "optimism": [
+      {
+        "contract": "0x7F5c764cBc14f9669B88837ca1490cCa17c31607",
+        "symbol": "USDC.e",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"
+      }
+    ],
+    "polygon": [
+      {
+        "contract": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        "symbol": "USDC.e",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+      }
+    ],
+    "sei": [
+      {
+        "contract": "0x3894085Ef7Ff0f0AeDf52E2A2704928d1EC074F1",
+        "symbol": "USDC.n",
+        "name": "USDC via Noble",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xe15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392"
+      }
+    ],
+    "sui": [
+      {
+        "contract": "0x5d4b302506645c37ff133b98c4b50a5ae14841659738d6d733d59d0d217a93bf::Coin::COIN",
+        "symbol": "USDC",
+        "name": "Wormhole Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC"
+      }
+    ],
+    "zksync": [
+      {
+        "contract": "0x3355df6D4c9C3035724Fd0e3914dE96A5a83aaf4",
+        "symbol": "USDC.e",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4"
+      }
+    ],
+    "xlayer": [
+      {
+        "contract": "0x74b7f16337b8972027f6196a17a631ac6de26d22",
+        "symbol": "USDC",
+        "name": "Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xB6CEceAB302E2E4948951eE7843FC24E92933061"
+      }
+    ],
+    "aptos": [
+      {
+        "contract": "0xf22bede237a07e121b56d91a491eb7bcdfd1f5907926a9e58338f964a01b17fa::asset::USDC",
+        "symbol": "USDC",
+        "name": "LayerZero Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"
+      },
+      {
+        "contract": "0x5e156f1207d0ebfa19a9eeff00d62a282278fb8719f4fab3a586a0a2c0fffbea::coin::T",
+        "symbol": "USDC",
+        "name": "Wormhole Bridged USDC",
+        "classification": "bridged",
+        "status": "non_canonical",
+        "canonical_contract": "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"
+      }
+    ]
+  },
+
+  "USDT": {
+    "bitcoin_omni": [
+      {
+        "asset_id": 31,
+        "symbol": "USDT",
+        "name": "Tether USD",
+        "classification": "legacy",
+        "status": "deprecated",
+        "protocol": "Omni"
+      }
+    ],
+    "bitcoin_cash_slp": [
+      {
+        "symbol": "USDT",
+        "name": "Tether USD",
+        "classification": "legacy",
+        "status": "deprecated",
+        "protocol": "SLP"
+      }
+    ],
+    "algorand": [
+      {
+        "asset_id": 312769,
+        "symbol": "USDT",
+        "name": "Tether USD",
+        "classification": "legacy",
+        "status": "deprecated",
+        "protocol": "Algorand ASA"
+      }
+    ],
+    "kusama": [
+      {
+        "asset_id": 1984,
+        "symbol": "USDT",
+        "name": "Tether USD",
+        "classification": "legacy",
+        "status": "deprecated",
+        "protocol": "Kusama AssetHub"
+      }
+    ],
+    "eos_vaulta": [
+      {
+        "symbol": "USDT",
+        "name": "Tether USD",
+        "classification": "legacy",
+        "status": "deprecated",
+        "protocol": "EOSIO.TOKEN"
+      }
+    ]
+  },
+
+  "EURT": {
+    "ethereum": [
+      {
+        "contract": "0xC581b735A1688071A1746c968e0798D642EDE491",
+        "symbol": "EURT",
+        "name": "Euro Tether",
+        "classification": "deprecated",
+        "status": "wound_down"
+      }
+    ]
+  },
+
+  "CNHT": {
+    "ethereum": [
+      {
+        "contract": "0x6e109e9dd7fa1a58bc3eff667e8e41fc3cc07aef",
+        "symbol": "CNHT",
+        "name": "CNH Tether",
+        "classification": "deprecated",
+        "status": "transitioning"
+      }
+    ],
+    "tron": [
+      {
+        "contract": "TCfCGjekyqmdYt1yxfUM5v5SDtaY6tuWik",
+        "symbol": "CNHT",
+        "name": "CNH Tether",
+        "classification": "deprecated",
+        "status": "transitioning"
+      }
+    ]
+  }
+}
