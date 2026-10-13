@@ -1,9 +1,11 @@
 """Local read-only dashboard. It does not start the bot.
 
-Bind address and port are fixed to this machine. The matching Streamlit
-config is .streamlit/config.toml.
+`python dashboard.py` serves the HTML panel on this machine, port 1337.
+render() remains the previous Streamlit view. The matching Streamlit
+config is .streamlit/config.toml. Do not start both servers at once.
 """
 
+import sys
 from datetime import datetime, timedelta, timezone
 
 from reporting.dashboard_data import default_paths, feedback_view, load_overview, report_view, risk_view, transfer_rows
@@ -188,5 +190,15 @@ def _table(st, rows, empty: str) -> None:
     st.dataframe(list(rows), hide_index=True, width="stretch")
 
 
+def main() -> None:
+    """Serve the HTML dashboard. This does not start the bot."""
+    from web_server import serve
+
+    serve(BIND_HOST, BIND_PORT)
+
+
 if __name__ == "__main__":
-    render()
+    if "streamlit.runtime.scriptrunner" in sys.modules:
+        render()
+    else:
+        main()

@@ -8,6 +8,7 @@ import logging
 import os
 import random
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ class EtherscanClient(BlockchainClient):
         self.metrics = APIMetrics()
         self.pool = RateLimitedPool(settings.etherscan_api_keys, {
             "rate": settings.etherscan_rate_per_key, "burst": settings.etherscan_burst,
+            "max_per_second": 5,
             "daily_limit": settings.etherscan_daily_limit,
             "daily_soft_ratio": settings.etherscan_daily_soft_ratio, "metrics": self.metrics,
             "db_path": str((Path(settings.data_dir) if Path(settings.data_dir).is_absolute() else Path(__file__).resolve().parents[1] / settings.data_dir) / "api_usage.sqlite"), "provider": "etherscan",
@@ -331,12 +333,64 @@ class EtherscanClient(BlockchainClient):
             return result[0]
         return None
 
+    async def get_address_tags(self, addresses: list[str]) -> dict[str, str]:
+        """Public Etherscan name tags. A missing plan or a failed call returns no names."""
+        unique: list[str] = []
+        seen: set[str] = set()
+        for raw in addresses:
+            if not isinstance(raw, str):
+                continue
+            address = raw.strip().lower()
+            if len(address) != 42 or not address.startswith("0x") or address in seen:
+                continue
+            seen.add(address)
+            unique.append(address)
+        if not unique:
+            return {}
+        try:
+            data = await self._request({
+                "chainid": str(ETHEREUM.chain_id),
+                "module": "nametag",
+                "action": "getaddresstag",
+                "address": ",".join(unique[:100]),
+            })
+        except Exception:
+            logger.warning("Adres adı alınamadı.")
+            return {}
+        return parse_address_tags(data)
+
     @staticmethod
     def _raise_rate_limit(data: dict[str, Any]) -> None:
         detail = data.get("result")
         message = f"{data.get('message', '')} {detail if isinstance(detail, str) else ''}".lower()
         if "rate limit" in message or "max calls per sec" in message:
             raise EtherscanRateLimitError("Etherscan istek sınırına ulaşıldı.")
+
+
+def parse_address_tags(data: dict[str, Any]) -> dict[str, str]:
+    """Keep only a public nametag. Labels and notes stay out of the message."""
+    result = data.get("result")
+    if not isinstance(result, list):
+        return {}
+    names: dict[str, str] = {}
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        address = str(item.get("address") or "").strip().lower()
+        tag = _public_name(item.get("nametag"))
+        if len(address) == 42 and address.startswith("0x") and tag:
+            names[address] = tag
+    return names
+
+
+def _public_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = "".join(
+        char for char in value
+        if unicodedata.category(char) not in {"Cc", "Cf", "Cs"} and char not in "\u202a\u202b\u202c\u202d\u202e"
+    )
+    return " ".join(cleaned.split())[:64]
 
 
 def _hex_int(value: Any, field_name: str) -> int:
@@ -356,7 +410,7 @@ def _cache_ttl(params: dict[str, Any], data: dict[str, Any]) -> float:
     if data.get("status") == "0" and "no transactions found" in str(result).lower(): return 15.0
     if action == "getLogs": return 0.0
     if action == "tokentx": return 5.0
-    if action in ("getsourcecode", "getcontractcreation"): return 86400.0
+    if action in ("getsourcecode", "getcontractcreation", "getaddresstag"): return 86400.0
     if action == "eth_getTransactionReceipt" and result is None: return 0.0
     if action in ("eth_getTransactionByHash", "eth_getTransactionReceipt"): return 0.0
     if action in ("eth_getCode", "eth_call") and result in ("0x", None): return 15.0

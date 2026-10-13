@@ -48,7 +48,7 @@ from pathlib import Path
 from audit_log import apply_feedback_expected, audit_event_key
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SUSPICIOUS_CLASSIFICATIONS = frozenset({"VARIANT", "KNOWN_FRAUD"})
 FEEDBACK_KINDS = frozenset({"CORRECT", "FALSE_POSITIVE", "UNSURE"})
 _FEEDBACK_CODES = {"c": "CORRECT", "f": "FALSE_POSITIVE", "u": "UNSURE"}
@@ -77,6 +77,7 @@ class WalletSettings:
     quiet_start: str | None = None
     quiet_end: str | None = None
     weekly_report: bool = False
+    fee_alerts: bool = False
 
 
 @dataclass(frozen=True)
@@ -363,7 +364,16 @@ def _migration_v3(connection: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS: list[tuple[int, object]] = [(1, _migration_v1), (2, _migration_v2), (3, _migration_v3)]
+def _migration_v4(connection: sqlite3.Connection) -> None:
+    """Per-wallet switch for sub-$0.01 fee notices. Default off: those alerts are not sent."""
+    connection.execute(
+        "ALTER TABLE wallet_settings ADD COLUMN fee_alerts INTEGER NOT NULL DEFAULT 0"
+    )
+
+
+MIGRATIONS: list[tuple[int, object]] = [
+    (1, _migration_v1), (2, _migration_v2), (3, _migration_v3), (4, _migration_v4),
+]
 
 
 def migrate(connection: sqlite3.Connection, steps: list[tuple[int, object]] | None = None) -> None:
@@ -420,7 +430,7 @@ class UserStateStore:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT alias, min_amount, suspicious_only, quiet_start, quiet_end, weekly_report
+                SELECT alias, min_amount, suspicious_only, quiet_start, quiet_end, weekly_report, fee_alerts
                 FROM wallet_settings
                 WHERE user_id=? AND network=? AND wallet_address=?
                 """,
@@ -441,6 +451,7 @@ class UserStateStore:
             quiet_start=row["quiet_start"],
             quiet_end=row["quiet_end"],
             weekly_report=bool(row["weekly_report"]),
+            fee_alerts=bool(row["fee_alerts"]),
         )
 
     def save_settings(
@@ -456,15 +467,16 @@ class UserStateStore:
                 """
                 INSERT INTO wallet_settings (
                     user_id, network, wallet_address, alias, min_amount,
-                    suspicious_only, quiet_start, quiet_end, weekly_report
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    suspicious_only, quiet_start, quiet_end, weekly_report, fee_alerts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, network, wallet_address) DO UPDATE SET
                     alias=excluded.alias,
                     min_amount=excluded.min_amount,
                     suspicious_only=excluded.suspicious_only,
                     quiet_start=excluded.quiet_start,
                     quiet_end=excluded.quiet_end,
-                    weekly_report=excluded.weekly_report
+                    weekly_report=excluded.weekly_report,
+                    fee_alerts=excluded.fee_alerts
                 """,
                 (
                     str(user_id),
@@ -476,6 +488,7 @@ class UserStateStore:
                     prefs.quiet_start,
                     prefs.quiet_end,
                     1 if prefs.weekly_report else 0,
+                    1 if prefs.fee_alerts else 0,
                 ),
             )
             self._connection.commit()

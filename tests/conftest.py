@@ -33,6 +33,19 @@ def pytest_runtest_logfinish(nodeid, location):
     })
 
 
+@pytest.fixture(autouse=True)
+def dashboard_login_disabled(monkeypatch):
+    """Tests run the panel without a login unless they set credentials themselves.
+
+    config loads .env on first import; import it first so a later lazy import
+    cannot bring the operator's real dashboard password back into the process.
+    """
+    import config  # noqa: F401
+
+    monkeypatch.delenv("DASHBOARD_USERNAME", raising=False)
+    monkeypatch.delenv("DASHBOARD_PASSWORD", raising=False)
+
+
 @pytest.fixture
 def eval_logger():
     def record_evaluation(

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from blockchain.base import BlockchainClient, BlockchainClientError
@@ -11,9 +12,69 @@ from monitor.wallet_store import WalletStateStore, WalletSubscription
 from providers.base import ChainProvider
 from infra.key_pool import CURRENT_PRIORITY, Priority
 from config import settings
+from networks import get_network_config
 
 
 logger = logging.getLogger(__name__)
+# Etherscan tokentx rejects a request once page * offset passes this window.
+HISTORY_WINDOW = 10_000
+
+
+def history_page_size(network: str) -> int:
+    """Largest single history page that still reaches the provider window."""
+    try:
+        family = get_network_config(network).family
+    except ValueError:
+        family = "evm"
+    if family == "tron":
+        return 200
+    return 1000
+
+
+def spare_history_pages(
+    pool,
+    *,
+    wallets: int,
+    reserve_interval: float,
+    approval_interval: float | None = None,
+    page_size: int = 1000,
+    now: datetime | None = None,
+    reset_hour: int | None = None,
+    clock: Callable[[], float] | None = None,
+) -> int:
+    """Extra history pages one wallet may take without spending the day's monitoring reserve.
+
+    The first page is always fetched by the caller. Zero means do not go further:
+    a key is cooling down after a rate limit, or the remaining daily calls are
+    already needed to keep polling until the quota resets.
+    """
+    if pool is None:
+        return 0
+    active = [
+        key for key in getattr(pool, "_keys", [])
+        if not getattr(key, "disabled", False) and not getattr(key, "exhausted", False)
+    ]
+    if not active:
+        return 0
+    tick = clock or time.monotonic
+    if any(getattr(key, "cooldown_until", 0) > tick() for key in active):
+        return 0
+    remaining = sum(max(0, int(pool._daily_limit) - int(key.calls)) for key in active)
+    current = now or datetime.now(timezone.utc)
+    hour = settings.daily_reset_utc_hour if reset_hour is None else reset_hour
+    reset = current.replace(hour=hour % 24, minute=0, second=0, microsecond=0)
+    if reset <= current:
+        reset += timedelta(days=1)
+    seconds_left = max(1.0, (reset - current).total_seconds())
+    wallet_count = max(1, wallets)
+    reserved = wallet_count * seconds_left / max(float(reserve_interval), 1.0)
+    if approval_interval:
+        reserved += wallet_count * seconds_left / max(float(approval_interval), 1.0)
+    per_wallet = int(remaining - reserved) // wallet_count
+    if per_wallet < 1:
+        return 0
+    max_extra = max(0, (HISTORY_WINDOW // max(1, page_size)) - 1)
+    return min(max_extra, per_wallet)
 
 
 class WalletMonitor:
@@ -46,6 +107,7 @@ class WalletMonitor:
         self.on_api_status = on_api_status
         self.on_baseline = on_baseline
         self.health_state = health_state
+        self.shared_wallets = 1
 
     def set_wallet_address(self, wallet_address: str) -> None:
         if self.provider is not None:
@@ -77,35 +139,69 @@ class WalletMonitor:
                 requested_wallet = self.wallet_address
                 wallet_version = self._wallet_version
                 transfers: list[TokenTransfer] = []
+                page_transfers: list[TokenTransfer] = []
                 page = 1
+                network = getattr(self.provider, "network", "ethereum")
+                fetch_limit = self.PAGE_SIZE
+                max_pages: int | None = None
+                if not self._initialized:
+                    fetch_limit = history_page_size(str(network))
+                    pool = getattr(self.provider, "pool", None) or getattr(
+                        getattr(self.provider, "client", None), "pool", None,
+                    )
+                    approval_interval = None
+                    try:
+                        if get_network_config(str(network)).family == "evm":
+                            approval_interval = settings.approval_poll_interval
+                    except ValueError:
+                        approval_interval = None
+                    max_pages = 1 + spare_history_pages(
+                        pool,
+                        wallets=self.shared_wallets,
+                        reserve_interval=settings.monitor_max_interval,
+                        approval_interval=approval_interval,
+                        page_size=fetch_limit,
+                    )
                 while True:
-                    if self.provider is not None:
-                        get_page = getattr(self.provider, "get_token_transfer_page", None)
-                        if callable(get_page):
-                            page_transfers = await get_page(requested_wallet, page, self.PAGE_SIZE)
-                        elif page == 1:
-                            page_transfers = await self.provider.get_token_transfers(
-                                requested_wallet, self.PAGE_SIZE
-                            )
+                    if (page - 1) * fetch_limit >= HISTORY_WINDOW:
+                        break
+                    try:
+                        if self.provider is not None:
+                            get_page = getattr(self.provider, "get_token_transfer_page", None)
+                            if callable(get_page):
+                                page_transfers = await get_page(requested_wallet, page, fetch_limit)
+                            elif page == 1:
+                                page_transfers = await self.provider.get_token_transfers(
+                                    requested_wallet, fetch_limit
+                                )
+                            else:
+                                break
                         else:
+                            if self.normalizer is None:
+                                raise ValueError("Ham transfer normalizer yapılandırılmamış.")
+                            raw_transfers = await self.client.get_token_transfers(
+                                requested_wallet,
+                                page=page,
+                                offset=fetch_limit,
+                            )
+                            page_transfers = self.normalizer(raw_transfers, requested_wallet)
+                    except (BlockchainClientError, ValueError):
+                        if transfers and not self._initialized:
+                            logger.warning(
+                                "Geçmiş taraması yarıda kesildi; %d olay ile başlanıyor.",
+                                len(transfers),
+                            )
                             break
-                    else:
-                        if self.normalizer is None:
-                            raise ValueError("Ham transfer normalizer yapılandırılmamış.")
-                        raw_transfers = await self.client.get_token_transfers(
-                            requested_wallet,
-                            page=page,
-                            offset=self.PAGE_SIZE,
-                        )
-                        page_transfers = self.normalizer(raw_transfers, requested_wallet)
+                        raise
                     transfers.extend(page_transfers)
 
-                    # tokentx sorts newest first. Once a page overlaps events
-                    # already tracked, older pages do not need to be fetched.
+                    # Newest page first. Stop on a short page, an already seen
+                    # event, the provider window, or a baseline budget limit.
                     if (
-                        not self._initialized
-                        or len(page_transfers) < self.PAGE_SIZE
+                        len(page_transfers) < fetch_limit
                         or any(self.tracker.has_seen(item) for item in page_transfers)
+                        or len(transfers) >= HISTORY_WINDOW
+                        or (max_pages is not None and page >= max_pages)
                     ):
                         break
                     page += 1
@@ -130,10 +226,27 @@ class WalletMonitor:
                     # The first successful response establishes the baseline;
                     # older events returned by tokentx are not new detections.
                     self._initialized = True
-                    logger.info(
-                        "Cüzdan izleme başladı; %d mevcut transfer olayı bulundu.",
-                        len(transfers),
+                    budget_stopped = (
+                        max_pages is not None
+                        and page >= max_pages
+                        and len(transfers) < HISTORY_WINDOW
+                        and len(page_transfers) >= fetch_limit
                     )
+                    if len(transfers) >= HISTORY_WINDOW:
+                        logger.info(
+                            "Cüzdan izleme başladı; %d mevcut transfer olayı alındı. Sağlayıcı penceresi doldu.",
+                            len(transfers),
+                        )
+                    elif budget_stopped:
+                        logger.info(
+                            "Cüzdan izleme başladı; %d mevcut transfer olayı alındı. Günlük API payı geçmişin devamına yetmiyor.",
+                            len(transfers),
+                        )
+                    else:
+                        logger.info(
+                            "Cüzdan izleme başladı; %d mevcut transfer olayı bulundu.",
+                            len(transfers),
+                        )
                     if self.on_baseline is not None:
                         try:
                             await self.on_baseline(transfers)
@@ -145,7 +258,10 @@ class WalletMonitor:
                         len(new_transfers),
                     )
                     if self.on_transfers is not None:
-                        await self.on_transfers(new_transfers)
+                        try:
+                            await self.on_transfers(new_transfers)
+                        except Exception:
+                            logger.exception("Yeni transferler işlenemedi.")
                 else:
                     logger.debug("Cüzdan kontrolü başarılı; yeni transfer yok.")
 
@@ -228,7 +344,10 @@ class WalletMonitorManager:
 
         async def transfers_callback(transfers: list[TokenTransfer]) -> None:
             for subscription in current_subscriptions():
-                await self.on_transfers(subscription, transfers)
+                try:
+                    await self.on_transfers(subscription, transfers)
+                except Exception:
+                    logger.exception("Yeni transferler işlenemedi.")
 
         async def status_callback(status: str) -> None:
             for subscription in current_subscriptions():
@@ -238,6 +357,9 @@ class WalletMonitorManager:
             if self.on_baseline is not None:
                 await self.on_baseline(network, wallet_address, transfers)
 
+        same_network = sum(
+            1 for item in self.store.all_subscriptions() if item.network == network
+        )
         monitor = WalletMonitor(
             client=provider,
             tracker=TransactionTracker(),
@@ -250,6 +372,7 @@ class WalletMonitorManager:
             health_state=self.health_state,
             on_baseline=baseline_callback if self.on_baseline is not None else None,
         )
+        monitor.shared_wallets = max(1, same_network)
         self._monitors[(network, wallet_address)] = monitor
         if stagger:
             await asyncio.sleep(stagger)
@@ -305,7 +428,13 @@ class WalletMonitorManager:
             logger.info("İzleme aralığı bütçeye göre %.2f saniye olarak ayarlandı.", self._effective_interval)
             self._last_interval_log = self._effective_interval
             self._last_interval_log_at = now
-        for monitor in self._monitors.values():
+        subscriptions = getattr(self.store, "all_subscriptions", None)
+        counts: dict[str, int] = {}
+        if callable(subscriptions):
+            for item in subscriptions():
+                counts[item.network] = counts.get(item.network, 0) + 1
+        for (network, _address), monitor in self._monitors.items():
+            monitor.shared_wallets = max(1, counts.get(network, 1))
             monitor.poll_interval = self._effective_interval
 
     async def run(self) -> None:

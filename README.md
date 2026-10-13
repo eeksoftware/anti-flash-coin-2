@@ -46,7 +46,7 @@ Cüzdan ayarları izlenen adresi değiştirmez. Takma ad boş olabilir. Minimum 
 
 Risk skoru, token sınıflandırmasından (`CANONICAL`/`VARIANT`/`KNOWN_FRAUD`/`UNKNOWN`) ve kullanıcı geri bildiriminden ayrı bir kavramdır. Sınıflandırmayı değiştirmez, `expected` alanına yazmaz. `analyzer/risk_engine.py` içindeki `Signal(name, weight, evidence, category, verified, source, network, event_key)` modeli üzerinden hesaplanır; skor 0–100 arasına sıkıştırılır. Aynı ada sahip sinyallerden yalnızca en güçlüsü sayılır; `verified=False` (sezgisel) sinyallerin ağırlığı yarıya iner. Seviyeler: `DÜŞÜK` <25, `ORTA` 25–49, `YÜKSEK` 50–74, `KRİTİK` ≥75. Ağırlıklar ve eşikler gerekçeli başlangıç değerleridir; etiketli veriyle kalibre edilmemiştir. Kayıtlı olmayan token tek başına 5 puan (DÜŞÜK) üretir. Her skor `weights_version` ile `data/user_state.sqlite` içindeki `detections` tablosuna yazılır; `event_key` alanı `transfer_feedback` ile birleştirilebilir, böylece yanlış pozitif geri bildirimleri sinyallerle birlikte değerlendirilebilir. `transactions.log` içindeki `signals` listesi artık tetiklenen sinyal adlarını taşır; diğer alanlar değişmez.
 
-Adres zehirlenmesi (address poisoning) tespiti sezgiseldir ve bildirimde "şüphe" olarak gösterilir. Her cüzdan için daha önce etkileşim kurulan karşı taraf adresleri `address_history` tablosunda tutulur; ilk izleme turundaki mevcut transferler bu geçmişi doldurur, bildirim üretmez. Yeni bir karşı taraf, aynı ağdaki bilinen bir adresle baş/son en az 4'er karakter örtüşüyor veya konumsal benzerlik ≥%60 ise `address_lookalike` sinyali üretilir; cüzdanın bu adresle ilk teması `lookalike_first_contact`, tutar ≤0.001 token ise `lookalike_dust_amount` eklenir. Ethereum adresleri küçük harfle karşılaştırılır; TRON adresleri Base58Check olarak büyük/küçük harf korunarak karşılaştırılır. Farklı ağlardaki adresler hiçbir zaman karşılaştırılmaz. Bulgu, "yalnızca şüpheli" filtresini geçer; minimum tutar ve sessiz saat filtreleri aynen uygulanır.
+Adres zehirlenmesi (address poisoning) tespiti sezgiseldir ve bildirimde "şüphe" olarak gösterilir. Her cüzdan için daha önce etkileşim kurulan karşı taraf adresleri `address_history` tablosunda tutulur; ilk izleme turundaki mevcut transferler bu geçmişi doldurur, bildirim üretmez. Yeni bir karşı taraf, aynı ağdaki bilinen bir adresle konumsal benzerliği %80'in üzerindeyse `address_lookalike` sinyali üretilir. Baştan veya sondan birkaç karakterin örtüşmesi, tek başına sinyal ve bildirim üretmez; cüzdanın bu adresle ilk teması `lookalike_first_contact`, tutar ≤0.001 token ise `lookalike_dust_amount` eklenir. Ethereum adresleri küçük harfle karşılaştırılır; TRON adresleri Base58Check olarak büyük/küçük harf korunarak karşılaştırılır. Farklı ağlardaki adresler hiçbir zaman karşılaştırılmaz. Bulgu, "yalnızca şüpheli" filtresini geçer; minimum tutar ve sessiz saat filtreleri aynen uygulanır.
 
 Approval (ERC-20 `Approval` olayı) izleme yalnızca EVM ağlarında çalışır; TRON sağlayıcısı `supports_approvals=False` döner ve atlanır. Ayrı bir döngü (`APPROVAL_POLL_INTERVAL`, varsayılan 60 sn) her cüzdan için Etherscan `getLogs` ile owner=cüzdan filtresi uygular; ilk turda yalnızca güncel blok imleci kaydedilir, geçmiş yetkiler bildirilmez. Durumlar: `NEW`, `INCREASED`, `DECREASED`, `REVOKED`, `UNLIMITED` (ham değer ≥ 2^255). Sinyaller: `unlimited_allowance` 30, `large_allowance` 15 (yalnızca ondalık biliniyorsa ve ≥1.000.000 token), `allowance_increase` 10, `new_allowance` 5, `known_fraud_spender` 60 (harcayıcı `known_fraud_tokens.json` içinde), `listed_risky_spender` 40 (`registry/known_spenders.json`, yalnızca `source` alanı olan kayıtlar). Bu dosya başlangıçta boştur; kaynaksız adres eklenmez. Büyük bir allowance tek başına dolandırıcılık sayılmaz. Approval bildirimi bilgilendirme amaçlıdır: bot yetki iptal etmez, işlem imzalamaz, özel anahtar istemez. Approval olayı transfer değildir; `transactions.log` ve karışıklık matrisine yazılmaz, `detections` tablosuna `kind=approval` olarak kaydedilir. Kullanıcı ayarlarından sessiz saat uygulanır, minimum tutar uygulanmaz; "yalnızca şüpheli" açıkken skor ≥25 olan approval'lar gönderilir.
 
@@ -64,9 +64,13 @@ Testler: `.venv/bin/python -m pytest -q`
 
 ## Yerel panel
 
-Panel, bu bilgisayarın tarayıcısında açılan salt okunur bir görünümdür. Kayıt silmez, sınıflandırma veya cüzdan ayarı değiştirmez, botu başlatmaz ve blockchain ya da Telegram'a istek atmaz. Adres `http://127.0.0.1:1337` dışına bağlanmaz. API anahtarı, bot tokenı, cüzdan adresi ve kullanıcı kimliği gösterilmez.
+Panel, bu bilgisayarın tarayıcısında açılan salt okunur bir görünümdür. Kayıt silmez, sınıflandırma veya cüzdan ayarı değiştirmez ve botu başlatmaz. Adres `http://127.0.0.1:1337` dışına bağlanmaz. API anahtarı ve bot tokenı gösterilmez. Genel bakış uçları cüzdan adresi ve kullanıcı kimliği döndürmez; bunlar yalnızca yerel Kullanıcılar sayfasında okunur.
 
-Bağımlılık Streamlit'tir. Kurulum:
+Arayüz `frontend/` altındaki HTML, CSS ve JavaScript dosyalarıdır. `web_server.py` bu dosyaları ve salt okunur JSON uçlarını sunar. Uçlar `reporting/dashboard_data.py` içindeki mevcut sorguları kullanır; tespit, risk hesabı ve veritabanı şeması değişmez. Sorgu bağlantıları `mode=ro` ve `PRAGMA query_only` ile açılır, böylece bot yazmaya devam edebilir.
+
+Sayfalar: Genel bakış, Transferler, Risk ve tespit, Geri bildirim, İstatistikler. Tarih aralığı UTC'dir ve bitiş anı dahil değildir. Boş veya eksik tabloda sayfa hata vermez; eksik kaynağı yazar, sıfır uydurmaz. Botun çalışıp çalışmadığı panelde yeşil durum olarak gösterilmez. Dosya varsa "yerel kayıtlar okunuyor", yoksa eksik kaynak yazılır.
+
+Kurulum:
 
 ~~~bash
 .venv/bin/pip install -r requirements.txt
@@ -75,10 +79,24 @@ Bağımlılık Streamlit'tir. Kurulum:
 Paneli, bot çalışırken ayrı bir terminalde açın:
 
 ~~~bash
+.venv/bin/python dashboard.py
+~~~
+
+Aynı sunucu `python web_server.py` ile de açılır. Adres: `http://127.0.0.1:1337`.
+
+Bot ayrı komutla başlar: `python3 main.py`. İkisi birbirini başlatmaz. Yazma isteği (`POST`, `PUT`, `DELETE`) 405 döner.
+
+Operasyon sayfaları kayıtlı verinin tamamını okur. Kayıtlar `app.log`, `transactions.log`, `detections.log`, `tests.log` ve `api_usage.log` dosyalarını en yeniden eskiye dizer. Kullanıcılar, cüzdan ayarları, geri bildirim ve karşı taraf geçmişi `runtime_state.json` ile `user_state.sqlite` tablolarından gelir. Seçilen kişinin adı, kullanıcı adı ve profil fotoğrafı, zaten bilinen kimlik için Telegram'dan okunur; bot tokenı tarayıcıya gitmez. Telegram yanıt vermezse yalnızca kimlik gösterilir. Bot ayarlarında token ve API anahtarı yerine yalnızca tanımlı olup olmadığı yazılır. Chats stores each new incoming and outgoing Telegram message with the sender name. Telegram does not return older messages, so the transcript starts when the bot process loads this version.
+
+Önceki Streamlit görünümü `render()` içindedir. Onu açmak için:
+
+~~~bash
 .venv/bin/streamlit run dashboard.py --server.address 127.0.0.1 --server.port 1337
 ~~~
 
-Bot ayrı komutla başlar: `python3 main.py`. İkisi birbirini başlatmaz. `.streamlit/config.toml` aynı adresi ve portu sabitler. Veri yoksa sayfalar boş durum gösterir; eksik tablo varsa bunu yazar, sıfır uydurmaz.
+İki sunucu aynı portu ister; aynı anda çalıştırmayın. `.streamlit/config.toml` bu adresi sabitler.
+
+Sorun giderme: port doluysa diğer panel sürecini kapatın. Sayfa boş uyarı gösteriyorsa `DATA_DIR` altındaki `user_state.sqlite`, `operations.sqlite` ve `runtime_state.json` dosyalarına bakın. Tarayıcı yalnızca `127.0.0.1` ile konuşur. Kullanıcılar sayfası dışında panel dış servise istek atmaz. JavaScript kapalıysa içerik çizilmez.
 
 ## Log formatı
 

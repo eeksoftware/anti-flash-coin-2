@@ -6,6 +6,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from time import perf_counter
 from typing import Any
 
@@ -190,12 +191,18 @@ class CheckService:
         cached: bool = False,
     ) -> None:
         if not result.transfers:
+            native = result.transaction.native_value if result.transaction is not None else Decimal(0)
+            symbol, native_label = ("TRX", "TRX transferi") if result.network == "tron" and native > 0 else (
+                ("ETH", "ETH transferi") if native > 0 else ("", "")
+            )
             log_transaction({
                 "ts": datetime.now(timezone.utc),
                 "source": "manual", "network": result.network,
                 "tx_hash": result.tx_hash, "event_key": f"manual:{uuid.uuid4().hex}",
                 "classification": result.classification,
-                "classification_label": CLASSIFICATION_LABELS.get(result.classification, "Bilinmeyen"),
+                "classification_label": native_label or CLASSIFICATION_LABELS.get(result.classification, "Bilinmeyen"),
+                "token_symbol": symbol,
+                "amount": format(native, "f") if native > 0 else "",
                 "signals": [], "expected": expected, "note": note,
                 "processing_ms": round(processing_ms, 3), "cached": cached,
                 "no_token_transfers": True,

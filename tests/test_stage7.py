@@ -40,7 +40,10 @@ from providers.tron import TronProvider
 
 WALLET = "0x" + "11" * 20
 KNOWN = "0x1234abcd" + "00" * 12 + "9876fedc"
-LOOKALIKE = "0x1234abcd" + "ff" * 12 + "9876fedc"
+# 33/40 characters match (82.5%). Exactly 80% and a 4+4 head/tail overlap do not.
+LOOKALIKE = "0x1234abcd" + "00" * 8 + "0" + "ff" * 3 + "f" + "9876fedc"
+BORDERLINE = "0x1234abcd" + "00" * 8 + "ff" * 4 + "9876fedc"
+SHORT_OVERLAP = "0x1234" + "ff" * 16 + "fedc"
 UNRELATED = "0x" + "77" * 20
 TOKEN = "0x" + "cd" * 20
 SPENDER = "0x" + "ee" * 20
@@ -70,6 +73,15 @@ def test_lookalike_detected_with_prefix_suffix_and_dust():
     names = {signal.name for signal in finding.signals}
     assert names == {"address_lookalike", "lookalike_first_contact", "lookalike_dust_amount"}
     assert all(not signal.verified for signal in finding.signals)
+
+
+def test_similarity_at_or_below_80_percent_is_not_a_finding():
+    assert address_poisoning.similarity(LOOKALIKE, KNOWN).ratio > 0.80
+    assert address_poisoning.similarity(BORDERLINE, KNOWN).ratio == 0.80
+    short = address_poisoning.similarity(SHORT_OVERLAP, KNOWN)
+    assert short.prefix == 4 and short.suffix == 4 and short.ratio < 0.80
+    assert address_poisoning.evaluate("ethereum", WALLET, BORDERLINE, Decimal("0.0001"), [KNOWN]) is None
+    assert address_poisoning.evaluate("ethereum", WALLET, SHORT_OVERLAP, Decimal("0.0001"), [KNOWN]) is None
 
 
 def test_unrelated_or_identical_addresses_produce_no_finding():
@@ -340,7 +352,7 @@ def test_migration_v2_tables_and_detection_join(tmp_path):
     with sqlite3.connect(path) as db:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"address_history", "detections", "allowances", "scan_cursors", "transfer_feedback", "wallet_settings"} <= tables
-        assert [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3]
+        assert [row[0] for row in db.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3, 4]
         joined = db.execute(
             "SELECT d.score, f.token FROM detections d JOIN transfer_feedback f ON f.event_key = d.event_key"
         ).fetchone()

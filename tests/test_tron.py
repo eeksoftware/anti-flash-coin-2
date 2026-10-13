@@ -17,11 +17,12 @@ from infra.metrics import APIMetrics
 from models.transaction import TokenTransfer
 from monitor.wallet_store import WalletStateStore, WalletSubscription
 from networks import get_network_config
-from notifications.telegram_formatter import format_transfer_alert
+from notifications.telegram_formatter import format_transfer_alert, format_tx_check
 from notifications.telegram_keyboards import history_result_keyboard, wallets_keyboard
 from providers.base import ChainProvider, ContractInfo
 from providers.tron import TronGridError, TronGridRateLimitError, TronProvider
 from services.check_input import parse_check_args
+from services.check_service import TxCheckResult
 
 
 TRON = get_network_config("tron")
@@ -275,13 +276,44 @@ def test_tron_transaction_status_and_confirmation(info, solid, expected):
     provider = bare_provider()
     body = {"txID": TXID, "ret": [{"contractRet": "SUCCESS"}], "raw_data": {"contract": []}}
     queue = [body, info, solid]
+    if solid:
+        queue.append({"block_header": {"raw_data": {"number": 15}}})
     async def request(*args, **kwargs): return queue.pop(0)
     provider._request = request
     result = asyncio.run(provider.get_transaction(TXID))
     assert result.status == expected
     assert result.confirmed is bool(solid)
+    if expected == "pending":
+        assert result.confirmations == 0
+    else:
+        assert result.confirmations == 11
     if expected == "success":
         assert result.block_number == 5 and result.block_time == datetime.fromtimestamp(1, timezone.utc)
+
+
+def test_tron_native_transfer_is_trx_not_a_missing_trc20():
+    provider = bare_provider()
+    body = {"txID": TXID, "ret": [{"contractRet": "SUCCESS"}], "raw_data": {"contract": [{
+        "type": "TransferContract",
+        "parameter": {"value": {"owner_address": "41" + "11" * 20, "to_address": "41" + "22" * 20, "amount": 45357371}},
+    }]}}
+    info = {"blockNumber": 86996765, "blockTimeStamp": 1_791_663_117_000, "receipt": {"net_usage": 268}}
+    solid = {"id": TXID, "blockNumber": 86996765}
+    head = {"block_header": {"raw_data": {"number": 87001000}}}
+    queue = [body, info, solid, head]
+    async def request(*args, **kwargs): return queue.pop(0)
+    provider._request = request
+    result = asyncio.run(provider.get_transaction(TXID))
+    assert result.native_value == Decimal("45.357371")
+    assert result.confirmations == 87001000 - 86996765 + 1
+    assert result.status == "success"
+    message = format_tx_check(TxCheckResult("tron", TXID, result, (), "UNKNOWN"))
+    assert "TRX transferi" in message.text
+    assert "45.357371" in message.text
+    assert "<code>TRX</code>" in message.text
+    assert "TRC-20 token transferi bulunamadı" not in message.text
+    assert "Bilinmeyen token" not in message.text
+    assert f"Onay: {result.confirmations:,}" in message.text
 
 
 def test_tron_transaction_not_found_is_none():

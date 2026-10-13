@@ -55,17 +55,29 @@ def _with_separator(title: str, body: str) -> str:
 
 
 def sanitize_token_text(value: Any, limit: int = 20) -> str:
-    """Remove control and bidi formatting characters from token supplied text."""
+    """Remove characters that make Telegram replace the whole message.
+
+    Control, format, surrogate and nonspacing marks are dropped. Visible
+    letters stay, including a Greek tau that only looks like a Latin T.
+    """
     bidi_controls = {
         "\u061c", "\u200e", "\u200f", "\u202a", "\u202b", "\u202c",
         "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069",
     }
     cleaned = "".join(
         char for char in str(value)
-        if unicodedata.category(char) not in {"Cc", "Cf", "Cs"}
+        if unicodedata.category(char) not in {"Cc", "Cf", "Cs", "Mn", "Me"}
         and char not in bidi_controls
     )
     return cleaned[:limit]
+
+
+def display_token_text(value: Any, limit: int = 20) -> str:
+    """Token symbol or name safe to send through Telegram."""
+    raw = str(value or "")
+    if not raw.strip():
+        return ""
+    return sanitize_token_text(raw, limit=max(len(raw), limit))[:limit]
 
 
 def format_token_amount(amount: Decimal) -> str:
@@ -336,15 +348,23 @@ def _direction_row(transfer: TokenTransfer) -> str:
     return _DIRECTION_ROWS.get(transfer.direction, _DIRECTION_ROWS["SEND"])
 
 
-def _party_rows(transfer: TokenTransfer) -> tuple[str, str]:
+def _party_rows(transfer: TokenTransfer, address_names: dict[str, str] | None = None) -> tuple[str, str]:
     return (
-        f"📤 Gönderen: <code>{escape(transfer.sender)}</code>",
-        f"📥 Alıcı: <code>{escape(transfer.receiver)}</code>",
+        _address_line("📤 Gönderen", transfer.sender, address_names),
+        _address_line("📥 Alıcı", transfer.receiver, address_names),
     )
 
 
+def _address_line(label: str, address: str, address_names: dict[str, str] | None = None) -> str:
+    line = f"{label}: <code>{escape(address)}</code>"
+    tag = (address_names or {}).get(str(address or "").lower(), "")
+    if tag:
+        line += f" <b>{escape(tag)}</b>"
+    return line
+
+
 def _amount_row(transfer: TokenTransfer) -> str:
-    symbol = sanitize_token_text(transfer.token_symbol)
+    symbol = display_token_text(transfer.token_symbol)
     return (
         f"🪙 Miktar: <b>{escape(format_token_amount(transfer.amount))} "
         f"<code>{escape(symbol)}</code></b>"
@@ -374,11 +394,12 @@ def format_transfer_alert(
     feedback_token: str | None = None,
     risk=None,
     poisoning=None,
+    address_names: dict[str, str] | None = None,
 ) -> FormattedMessage:
     severity, classification = CLASSIFICATION_STYLE.get(
         analysis.classification, ("⚪", "Bilinmeyen token")
     )
-    name = sanitize_token_text(transfer.token_name)
+    name = display_token_text(transfer.token_name)
     rows = [
         f"{severity} <b>Token Transferi · {escape(classification)}</b>",
         SEPARATOR,
@@ -405,8 +426,8 @@ def format_transfer_alert(
         )
     rows.extend(_risk_rows(risk))
     rows.extend([
-        *_party_rows(transfer),
-        f"📄 Token kontratı: <code>{escape(transfer.token_address)}</code>",
+        *_party_rows(transfer, address_names),
+        _address_line("📄 Token kontratı", transfer.token_address, address_names),
         f"🔗 TXID: <code>{escape(transfer.tx_hash)}</code>",
     ])
     wallet_address = transfer.receiver if transfer.direction == "RECEIVE" else transfer.sender
@@ -450,7 +471,7 @@ def format_approval_alert(event, assessment, risk, *, alias: str | None = None, 
     if assessment.human_value is not None and assessment.state != "UNLIMITED":
         amount = escape(format_token_amount(assessment.human_value))
         if token_symbol:
-            amount += f" <code>{escape(sanitize_token_text(token_symbol))}</code>"
+            amount += f" <code>{escape(display_token_text(token_symbol))}</code>"
     elif assessment.state == "UNLIMITED":
         amount = "sınırsız"
     else:
@@ -500,10 +521,49 @@ def format_wallet_settings(address: str, network: str, prefs) -> FormattedMessag
         "ℹ️ Saatler UTC'dir. Başlangıç ve bitiş aynıysa filtre kapalıdır.",
         f"🗓️ Haftalık özet: <b>{'Açık' if prefs.weekly_report else 'Kapalı'}</b>",
         "ℹ️ Haftalık özet transfer bildiriminden bağımsızdır. Kapalıyken kayıt sürer.",
+        f"💸 Fee bildirimi: <b>{'Açık' if prefs.fee_alerts else 'Kapalı'}</b>",
+        "ℹ️ 0,01 USD altı fee sayılır. Kapalıyken gönderilmez. Açıkken kısa fee mesajı gider. Şüpheli tespit bu filtreden geçmez.",
     ])
     return FormattedMessage(
         _with_separator("⚙️ <b>Cüzdan Ayarları</b>", body),
         reply_markup=wallet_settings_keyboard(address, network),
+    )
+
+
+def format_fee_alert(
+    transfer: TokenTransfer,
+    usd: Decimal,
+    *,
+    alias: str | None = None,
+    address_names: dict[str, str] | None = None,
+) -> FormattedMessage:
+    """Short notice for a transfer worth under 0.01 USD."""
+    rows = [
+        "💸 <b>Fee</b>",
+        SEPARATOR,
+        _time_row(transfer),
+        _amount_row(transfer),
+        f"💵 USD: <b>{escape(format_usd(usd, Decimal(1)) or '<$0.01')}</b>",
+        f"🌐 Ağ: {escape(get_network_config(transfer.network).display_name)}",
+    ]
+    if alias:
+        rows.append(f"👛 Takma ad: <code>{escape(alias)}</code>")
+    for label, address in (("📤 Gönderen", transfer.sender), ("📥 Alıcı", transfer.receiver)):
+        if (address_names or {}).get(str(address or "").lower()):
+            rows.append(_address_line(label, address, address_names))
+    rows.extend([
+        f"🔗 TXID: <code>{escape(transfer.tx_hash)}</code>",
+        "ℹ️ 0,01 USD altı. Kayıt durur; bu kısa biçim yalnızca fee bildirimi açıkken gider.",
+    ])
+    wallet_address = transfer.receiver if transfer.direction == "RECEIVE" else transfer.sender
+    return FormattedMessage(
+        "\n".join(rows),
+        reply_markup=transfer_alert_keyboard(
+            transfer.network,
+            transfer.tx_hash,
+            transfer.token_address,
+            wallet_address,
+        ),
     )
 
 
@@ -763,8 +823,8 @@ def format_token_check(result) -> FormattedMessage:
     classification = analysis.classification if analysis is not None else "UNKNOWN"
     severity, label = CLASSIFICATION_STYLE.get(classification, CLASSIFICATION_STYLE["UNKNOWN"])
     info = result.contract_info
-    symbol = sanitize_token_text(info.symbol or "Bilinmiyor")
-    name = sanitize_token_text(info.name or "").replace("\n", " ")
+    symbol = display_token_text(info.symbol or "Bilinmiyor")
+    name = display_token_text(info.name or "")
     rows = [
         f"{severity} <b>Token Kontrolü · {escape(label)}</b>",
         SEPARATOR,
@@ -786,7 +846,13 @@ def format_token_check(result) -> FormattedMessage:
     )
 
 
-def format_tx_check(result, *, eth_usd_price: Decimal | None = None) -> FormattedMessage:
+def _native_asset(network: str) -> tuple[str, str]:
+    if network == "tron":
+        return "TRX", "TRX transferi"
+    return "ETH", "ETH transferi"
+
+
+def format_tx_check(result, *, eth_usd_price: Decimal | None = None, address_names: dict[str, str] | None = None) -> FormattedMessage:
     from notifications.telegram_keyboards import url_button
     from networks import get_network_config
 
@@ -796,9 +862,10 @@ def format_tx_check(result, *, eth_usd_price: Decimal | None = None) -> Formatte
     classification = result.classification
     severity, label = CLASSIFICATION_STYLE.get(classification, CLASSIFICATION_STYLE["UNKNOWN"])
     transaction = result.transaction
+    symbol, native_label = _native_asset(result.network)
     native_transfer = transaction.native_value > 0 and transaction.status == "success"
     if not result.transfers:
-        label = "ETH transferi" if native_transfer else "Token transferi yok"
+        label = native_label if native_transfer else "Token transferi yok"
     status = {"success": "✅ Başarılı", "failed": "❌ Başarısız", "pending": "⏳ Beklemede"}.get(transaction.status, "⏳ Beklemede")
     rows = [
         f"{severity} <b>İşlem Kontrolü · {escape(label)}</b>",
@@ -825,40 +892,45 @@ def format_tx_check(result, *, eth_usd_price: Decimal | None = None) -> Formatte
         ),
         None,
     )
-    if not result.transfers:
+    if not result.transfers and not native_transfer:
         standard = "TRC-20" if result.network == "tron" else "ERC-20"
         rows.append(f"ℹ️ Bu işlemde {standard} token transferi bulunamadı.")
     if transaction.native_value > 0:
-        usd_value = format_usd(transaction.native_value, eth_usd_price)
-        usd_suffix = f" ({escape(usd_value)})" if usd_value is not None else " (USD fiyatı alınamadı)"
+        usd_value = format_usd(transaction.native_value, eth_usd_price) if result.network == "ethereum" else None
+        if usd_value is not None:
+            usd_suffix = f" ({escape(usd_value)})"
+        elif result.network == "ethereum":
+            usd_suffix = " (USD fiyatı alınamadı)"
+        else:
+            usd_suffix = ""
         if native_transfer:
             rows.extend([
                 SEPARATOR,
-                "💠 <b>ETH transferi</b>",
-                f"🪙 Miktar: <b>{escape(format_token_amount(transaction.native_value))} <code>ETH</code>{usd_suffix}</b>",
-                f"📤 Gönderen: <code>{escape(transaction.from_address)}</code>",
+                f"💠 <b>{escape(native_label)}</b>",
+                f"🪙 Miktar: <b>{escape(format_token_amount(transaction.native_value))} <code>{escape(symbol)}</code>{usd_suffix}</b>",
+                _address_line("📤 Gönderen", transaction.from_address, address_names),
             ])
             if transaction.to_address:
-                rows.append(f"📥 Alıcı: <code>{escape(transaction.to_address)}</code>")
+                rows.append(_address_line("📥 Alıcı", transaction.to_address, address_names))
         else:
             rows.extend([
                 SEPARATOR,
-                f"💠 İşlemdeki ETH değeri: <b>{escape(format_token_amount(transaction.native_value))} <code>ETH</code>{usd_suffix}</b>",
-                "⚠️ İşlem başarısız veya beklemede olduğu için ETH transferi kesinleşmedi.",
+                f"💠 İşlemdeki {escape(symbol)} değeri: <b>{escape(format_token_amount(transaction.native_value))} <code>{escape(symbol)}</code>{usd_suffix}</b>",
+                f"⚠️ İşlem başarısız veya beklemede olduğu için {escape(symbol)} transferi kesinleşmedi.",
             ])
     visible = list(result.transfers[:5])
     for index, item in enumerate(visible, 1):
         transfer = item.transfer
         style, item_label = CLASSIFICATION_STYLE.get(item.analysis.classification, CLASSIFICATION_STYLE["UNKNOWN"])
-        symbol = sanitize_token_text(transfer.token_symbol)
+        symbol = display_token_text(transfer.token_symbol)
         rows.extend([
             SEPARATOR,
             f"{style} <b>Token transferi {index} · {escape(item_label)}</b>",
             f"🪙 Miktar: <b>{escape(format_token_amount(transfer.amount))} <code>{escape(symbol)}</code></b>",
             f"🛡️ Sınıflandırma: <b>{escape(item_label)}</b>",
-            f"📤 Gönderen: <code>{escape(transfer.sender)}</code>",
-            f"📥 Alıcı: <code>{escape(transfer.receiver)}</code>",
-            f"📄 Token kontratı: <code>{escape(transfer.token_address)}</code>",
+            _address_line("📤 Gönderen", transfer.sender, address_names),
+            _address_line("📥 Alıcı", transfer.receiver, address_names),
+            _address_line("📄 Token kontratı", transfer.token_address, address_names),
         ])
     if len(result.transfers) > len(visible):
         rows.append(f"+{len(result.transfers) - len(visible)} transfer daha")

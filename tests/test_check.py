@@ -13,7 +13,8 @@ from blockchain.etherscan import EtherscanClient
 from blockchain.etherscan import EtherscanRateLimitError
 from models.transaction import TokenTransfer
 from monitor.transaction_tracker import TransactionTracker
-from monitor.wallet_monitor import WalletMonitor
+from blockchain.base import BlockchainClientError
+from monitor.wallet_monitor import HISTORY_WINDOW, WalletMonitor, history_page_size, spare_history_pages
 from networks import get_network_config
 from notifications.telegram_formatter import (
     MAX_TELEGRAM_TEXT_UNITS,
@@ -440,3 +441,225 @@ def test_wallet_monitor_using_fake_provider_keeps_golden_classifications():
 
     asyncio.run(run_monitor())
     assert observed == ["KNOWN_FRAUD"]
+
+
+def test_wallet_monitor_continues_after_transfer_handler_fails():
+    first = transfer(USDT, tx_hash="0x" + "1" * 64)
+    failed = transfer(USDT, tx_hash="0x" + "2" * 64, log_index=2)
+    later = transfer(FRAUD, tx_hash="0x" + "3" * 64, log_index=3)
+
+    class MonitoringProvider(FakeProvider):
+        def __init__(self):
+            super().__init__()
+            self.polls = 0
+
+        async def get_token_transfer_page(self, address, page, limit):
+            self.polls += 1
+            if self.polls == 1:
+                return [first]
+            if self.polls == 2:
+                return [first, failed]
+            return [first, failed, later]
+
+    seen: list[str] = []
+    detected = asyncio.Event()
+
+    async def on_transfers(batch):
+        if any(item.tx_hash == failed.tx_hash for item in batch):
+            raise TypeError("type NoneType doesn't define __round__ method")
+        seen.extend(item.tx_hash for item in batch)
+        detected.set()
+
+    monitor = WalletMonitor(
+        client=MonitoringProvider(),
+        tracker=TransactionTracker(),
+        wallet_address=WALLET,
+        poll_interval=0.01,
+        max_poll_interval=0.02,
+        on_transfers=on_transfers,
+    )
+
+    async def run_monitor():
+        task = asyncio.create_task(monitor.run())
+        try:
+            await asyncio.wait_for(detected.wait(), timeout=2)
+            assert not task.done()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run_monitor())
+    assert seen == [later.tx_hash]
+
+
+class _Key:
+    def __init__(self, calls=0, cooldown_until=0.0):
+        self.disabled = False
+        self.exhausted = False
+        self.calls = calls
+        self.cooldown_until = cooldown_until
+
+
+class _Pool:
+    def __init__(self, daily_limit, keys):
+        self._daily_limit = daily_limit
+        self._keys = keys
+
+
+def test_spare_history_pages_follows_daily_budget_and_cooldown():
+    noon = datetime(2026, 10, 10, 12, tzinfo=timezone.utc)
+    plenty = spare_history_pages(
+        _Pool(100_000, [_Key(), _Key()]),
+        wallets=2, reserve_interval=30, approval_interval=60, page_size=1000,
+        now=noon, reset_hour=0, clock=lambda: 0,
+    )
+    assert plenty == (HISTORY_WINDOW // 1000) - 1
+    tight = spare_history_pages(
+        _Pool(100, [_Key()]),
+        wallets=2, reserve_interval=30, approval_interval=60, page_size=1000,
+        now=noon, reset_hour=0, clock=lambda: 0,
+    )
+    assert tight == 0
+    cooling = spare_history_pages(
+        _Pool(100_000, [_Key(cooldown_until=50)]),
+        wallets=1, reserve_interval=30, approval_interval=None, page_size=1000,
+        now=noon, reset_hour=0, clock=lambda: 0,
+    )
+    assert cooling == 0
+    assert spare_history_pages(None, wallets=1, reserve_interval=30) == 0
+    assert history_page_size("ethereum") == 1000
+    assert history_page_size("tron") == 200
+
+
+def _history_batch(page: int, count: int) -> list[TokenTransfer]:
+    return [
+        transfer(USDT, tx_hash="0x" + f"{page:02x}{index:062x}", log_index=index)
+        for index in range(count)
+    ]
+
+
+def test_baseline_fetches_until_short_page_when_budget_allows():
+    class Provider:
+        network = "ethereum"
+        pool = _Pool(100_000, [_Key()])
+
+        def __init__(self):
+            self.pages = []
+
+        async def get_transaction(self, tx_hash):
+            return None
+
+        async def get_token_transfer_page(self, address, page, limit):
+            self.pages.append((page, limit))
+            if page < 3:
+                return _history_batch(page, limit)
+            return _history_batch(page, 1)
+
+    provider = Provider()
+    seen = []
+
+    async def on_baseline(items):
+        seen.append(len(items))
+
+    async def on_transfers(items):
+        raise AssertionError("baseline history must not alert")
+
+    monitor = WalletMonitor(
+        provider, TransactionTracker(), WALLET, 0.01, 0.02,
+        on_transfers=on_transfers, on_baseline=on_baseline,
+    )
+
+    async def run():
+        task = asyncio.create_task(monitor.run())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert provider.pages[:3] == [(1, 1000), (2, 1000), (3, 1000)]
+    assert seen == [2001]
+
+
+def test_baseline_stops_at_one_page_when_daily_budget_is_reserved():
+    class Provider:
+        network = "ethereum"
+        pool = _Pool(10, [_Key()])
+
+        def __init__(self):
+            self.pages = []
+
+        async def get_transaction(self, tx_hash):
+            return None
+
+        async def get_token_transfer_page(self, address, page, limit):
+            self.pages.append(page)
+            return _history_batch(page, limit)
+
+    provider = Provider()
+
+    async def on_baseline(items):
+        return None
+
+    monitor = WalletMonitor(
+        provider, TransactionTracker(), WALLET, 0.01, 0.02, on_baseline=on_baseline,
+    )
+
+    async def run():
+        task = asyncio.create_task(monitor.run())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert provider.pages == [1]
+
+
+def test_baseline_keeps_partial_history_when_a_later_page_fails():
+    fresh = transfer(FRAUD, tx_hash="0x" + "f" * 64, log_index=9)
+
+    class Provider:
+        network = "ethereum"
+        pool = _Pool(100_000, [_Key()])
+
+        def __init__(self):
+            self.started = False
+
+        async def get_transaction(self, tx_hash):
+            return None
+
+        async def get_token_transfer_page(self, address, page, limit):
+            if not self.started:
+                if page == 1:
+                    return _history_batch(1, limit)
+                self.started = True
+                raise BlockchainClientError("Etherscan istek sınırına ulaşıldı.")
+            return [fresh]
+
+    provider = Provider()
+    baselined = []
+    alerted = []
+    detected = asyncio.Event()
+
+    async def on_baseline(items):
+        baselined.append(len(items))
+
+    async def on_transfers(items):
+        alerted.extend(item.tx_hash for item in items)
+        detected.set()
+
+    monitor = WalletMonitor(
+        provider, TransactionTracker(), WALLET, 0.01, 0.02,
+        on_transfers=on_transfers, on_baseline=on_baseline,
+    )
+
+    async def run():
+        task = asyncio.create_task(monitor.run())
+        try:
+            await asyncio.wait_for(detected.wait(), timeout=2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+    assert baselined == [1000]
+    assert alerted == [fresh.tx_hash]

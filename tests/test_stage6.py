@@ -26,7 +26,7 @@ from monitor.state_db import (
 from monitor.wallet_store import WalletSubscription
 from notifications.telegram import TelegramBotController
 from notifications.telegram_formatter import format_transfer_alert, format_wallet_settings
-from notifications.telegram_keyboards import wallet_settings_keyboard
+from notifications.telegram_keyboards import transfer_alert_keyboard, wallet_settings_keyboard
 from analyzer.token_analyzer import TokenAnalysis
 
 
@@ -365,3 +365,76 @@ def test_feedback_callback_answers_and_rejects_unauthorized(tmp_path):
     missing["message"] = {"message_id": 1, "chat": {"id": 7, "type": "private"}}
     asyncio.run(controller._handle_callback_query(missing))
     assert notifier.answered[-1] == ("cb-2", "Bu geri bildirim geçersiz.")
+
+
+def test_feedback_click_updates_the_alert(tmp_path):
+    saved = store(tmp_path)
+    token = saved.register_alert(
+        user_id="7", network="ethereum", wallet_address=WALLET,
+        classification="KNOWN_FRAUD", record=record(),
+    )
+    alert = "🚨 Uyarı\n\nUSDT"
+    markup = transfer_alert_keyboard(
+        "ethereum", "0x" + "ab" * 32, "0x" + "cd" * 20, WALLET, token,
+    )
+
+    class Notifier:
+        def __init__(self):
+            self.answered = []
+            self.edits = []
+
+        async def answer_callback_query(self, callback_id, text=None, show_alert=False):
+            self.answered.append((callback_id, text, show_alert))
+
+        async def edit_text(self, chat_id, message_id, text, reply_markup=None, entities=None):
+            self.edits.append((chat_id, message_id, text, reply_markup, entities))
+
+    class Wallets:
+        def for_user(self, user_id):
+            if user_id == "7":
+                return [WalletSubscription("7", "ethereum", WALLET)]
+            return []
+
+    notifier = Notifier()
+    controller = TelegramBotController(
+        "token", object(), notifier, Wallets(), object(), activity_log_chat_id="", user_state=saved,
+    )
+    message = {
+        "message_id": 41,
+        "text": alert,
+        "entities": [{"type": "bold", "offset": 7, "length": 1}],
+        "chat": {"id": 7, "type": "private"},
+        "reply_markup": markup,
+    }
+    asyncio.run(controller._handle_callback_query({
+        "id": "cb-ok",
+        "data": feedback_callback("CORRECT", token),
+        "from": {"id": 7},
+        "message": message,
+    }))
+    assert notifier.answered == [("cb-ok", "Geri bildirimin kaydedildi.", True)]
+    assert saved.feedback(token).feedback == "CORRECT"
+    chat_id, message_id, text, updated, entities = notifier.edits[-1]
+    assert (chat_id, message_id) == (7, 41)
+    assert text == alert + "\n\n✅ Geri bildirim: Doğru tespit"
+    assert text.count("✅ Geri bildirim:") == 1
+    assert entities == [{"type": "bold", "offset": 7, "length": 1}]
+    labels = [button["text"] for row in updated["inline_keyboard"] for button in row]
+    assert labels[-3:] == ["✅ Doğru tespit", "👎 Yanlış alarm", "❓ Emin değilim"]
+    assert updated["inline_keyboard"][0] == markup["inline_keyboard"][0]
+
+    message["text"] = text
+    message["reply_markup"] = updated
+    asyncio.run(controller._handle_callback_query({
+        "id": "cb-again",
+        "data": feedback_callback("FALSE_POSITIVE", token),
+        "from": {"id": 7},
+        "message": message,
+    }))
+    assert notifier.answered[-1] == ("cb-again", "Geri bildirimin kaydedildi.", True)
+    replaced = notifier.edits[-1][2]
+    assert replaced == alert + "\n\n✅ Geri bildirim: Yanlış alarm"
+    assert replaced.count("✅ Geri bildirim:") == 1
+    labels = [button["text"] for row in notifier.edits[-1][3]["inline_keyboard"] for button in row]
+    assert labels[-3:] == ["👍 Doğru tespit", "✅ Yanlış alarm", "❓ Emin değilim"]
+    assert saved.feedback(token).feedback == "FALSE_POSITIVE"

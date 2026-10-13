@@ -26,6 +26,7 @@ TRON = get_network_config("tron")
 TRANSFER_TOPIC = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 MAX_DECIMALS = 36
 DEFAULT_DECIMALS = 6
+SUN = Decimal(1_000_000)
 
 
 class TronGridError(BlockchainClientError):
@@ -293,8 +294,23 @@ class TronProvider:
         stamp = _int_or_none(info.get("blockTimeStamp"))
         block_time = datetime.fromtimestamp(stamp / 1000, timezone.utc) if stamp is not None else None
         confirmed = bool(solid) if isinstance(solid, dict) else False
-        return TransactionInfo(tx_hash, status, block, block_time, 1 if confirmed else 0,
-            _hex_address_or_empty(owner), _hex_address_or_none(to), Decimal(0), confirmed)
+        confirmations = await self._confirmations(block, confirmed)
+        native_value = _native_trx(raw_data)
+        return TransactionInfo(tx_hash, status, block, block_time, confirmations,
+            _hex_address_or_empty(owner), _hex_address_or_none(to), native_value, confirmed)
+
+    async def _confirmations(self, block: int | None, confirmed: bool) -> int | None:
+        if block is None or not confirmed:
+            return 0 if block is not None else None
+        try:
+            now = await self._request("POST", "/walletsolidity/getnowblock", body={}, cache_ttl=3)
+        except TronGridError:
+            return None
+        header = ((now.get("block_header") or {}).get("raw_data") or {}) if isinstance(now, dict) else {}
+        head = _int_or_none(header.get("number"))
+        if head is None:
+            return None
+        return max(0, head - block + 1)
 
     async def get_transaction_token_transfers(self, tx_hash: str) -> list[TokenTransfer]:
         normalized_hash = TRON.normalize_tx_hash(tx_hash)
@@ -394,6 +410,22 @@ def _hex_address_or_none(value):
 
 def _hex_address_or_empty(value):
     return _hex_address_or_none(value) or ""
+
+
+def _native_trx(raw_data: Any) -> Decimal:
+    """TRX moves in TransferContract, in sun. A TRC-20 call is not this field."""
+    contracts = raw_data.get("contract") if isinstance(raw_data, dict) else None
+    contract = contracts[0] if isinstance(contracts, list) and contracts and isinstance(contracts[0], dict) else {}
+    if contract.get("type") != "TransferContract":
+        return Decimal(0)
+    value = ((contract.get("parameter") or {}).get("value") or {}) if isinstance(contract.get("parameter"), dict) else {}
+    try:
+        sun = Decimal(str(value.get("amount")))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(0)
+    if sun < 0:
+        return Decimal(0)
+    return sun / SUN
 
 
 def _decode_abi_text(value: str) -> str | None:

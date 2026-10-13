@@ -14,9 +14,9 @@ from analyzer.risk_engine import Signal, make_signal
 from networks import NetworkConfig, get_network_config
 
 
-PREFIX_MIN = 4
-SUFFIX_MIN = 4
-RATIO_MIN = 0.60
+# Positional match must be strictly above 80%. A shared 4-character head or
+# tail is not enough on its own; those addresses stay out of risk and alerts.
+RATIO_MIN = 0.80
 DUST_AMOUNT = Decimal("0.001")
 
 
@@ -29,7 +29,7 @@ class Similarity:
 
     @property
     def lookalike(self) -> bool:
-        return (self.prefix >= PREFIX_MIN and self.suffix >= SUFFIX_MIN) or self.ratio >= RATIO_MIN
+        return self.ratio > RATIO_MIN
 
 
 @dataclass(frozen=True)

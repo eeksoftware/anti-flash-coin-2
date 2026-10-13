@@ -126,6 +126,34 @@ def assert_balanced_html(text: str) -> None:
     assert not parser.tags
 
 
+def test_lookalike_symbol_is_not_sent_to_telegram():
+    symbol = "\ua4f4\u17b5\u054f\u13a0\u17b5\u2ca6"
+    message = format_transfer_alert(
+        make_transfer(symbol=symbol, name=symbol, amount="213.091773"),
+        TokenAnalysis("UNKNOWN"),
+    )
+    assert "\u17b5" not in message.text
+    assert symbol not in message.text
+    assert "Lookalike" not in message.text
+    assert "USD" not in message.text
+    assert "\ua4f4" in message.text and "\u2ca6" in message.text
+    assert "ASCII" not in message.text
+    assert "Bilinmeyen token" in message.text
+    assert_balanced_html(message.text)
+
+
+def test_invisible_marks_are_removed_and_the_visible_letters_stay():
+    symbol = "U\u206fS\u206fD\u03a4"
+    message = format_transfer_alert(
+        make_transfer(symbol=symbol, name=symbol, amount="608.555449"),
+        TokenAnalysis("UNKNOWN"),
+    )
+    assert "Lookalike" not in message.text
+    assert "\u206f" not in message.text
+    assert "<code>USD\u03a4</code>" in message.text
+    assert_balanced_html(message.text)
+
+
 def test_attacker_controlled_token_symbol_is_sanitized_and_escaped():
     message = format_transfer_alert(
         make_transfer(symbol="<b>x</b>&"),

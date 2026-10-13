@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -117,6 +118,25 @@ def load_overview(paths: DataPaths, *, now: datetime | None = None) -> Overview:
         wallets, transfers, transfers_24h, transfers_7d, by_class, by_risk,
         recent_transfers, recent_detections, tuple(notes),
     )
+
+
+def system_summary(data_dir: Path) -> dict:
+    """Verifiable host figures for the overview card. No keys, tokens, or addresses."""
+    root = data_dir if data_dir.is_absolute() else Path(__file__).resolve().parents[1] / data_dir
+    eth_count, tron_count, eth_limit, tron_limit, log_dir = _summary_settings()
+    total = eth_count + tron_count
+    exhausted = _exhausted_keys(root / "api_usage.sqlite", eth_limit, tron_limit, eth_count, tron_count)
+    active = max(0, total - exhausted)
+    last_api, last_telegram = _heartbeat_times(root / "heartbeat")
+    return {
+        "api_keys_active": active,
+        "api_keys_total": total,
+        "api_keys_ready": total > 0 and active == total,
+        "last_api": last_api,
+        "last_telegram": last_telegram,
+        "log_size": _directory_size(log_dir),
+        "disk_free": _disk_free(log_dir if log_dir.exists() else root),
+    }
 
 
 def transfer_rows(
@@ -599,6 +619,105 @@ def _tables(connection) -> set[str]:
 
 def _iso(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).isoformat()
+
+
+def _summary_settings() -> tuple[int, int, int, int, Path]:
+    root = Path(__file__).resolve().parents[1]
+    try:
+        from config import settings
+        eth_count = len(tuple(settings.etherscan_api_keys or ()))
+        tron_count = len(tuple(settings.trongrid_api_keys or ()))
+        eth_limit = int(float(settings.etherscan_daily_limit) * float(settings.etherscan_daily_soft_ratio))
+        tron_limit = int(float(settings.trongrid_daily_limit) * float(settings.trongrid_daily_soft_ratio))
+        log_dir = Path(settings.log_dir)
+        if not log_dir.is_absolute():
+            log_dir = root / log_dir
+    except Exception:
+        logger.warning("Sistem özeti ayarları okunamadı.")
+        return 0, 0, 0, 0, root / "logs"
+    return eth_count, tron_count, eth_limit, tron_limit, log_dir
+
+
+def _usage_day() -> str:
+    import os
+    hour = int(os.getenv("DAILY_RESET_UTC_HOUR", "0") or "0") % 24
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(hours=hour)).date().isoformat()
+
+
+def _exhausted_keys(path: Path, eth_limit: int, tron_limit: int, eth_count: int, tron_count: int) -> int:
+    connection = _connect(path)
+    if connection is None or eth_limit <= 0 and tron_limit <= 0:
+        return 0
+    try:
+        rows = connection.execute(
+            "SELECT provider, calls FROM api_usage_daily WHERE day=?",
+            (_usage_day(),),
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    finally:
+        connection.close()
+    eth = tron = 0
+    for row in rows:
+        provider = str(row["provider"] or "")
+        calls = int(row["calls"] or 0)
+        if provider == "etherscan" and eth_limit > 0 and calls >= eth_limit:
+            eth += 1
+        elif provider == "trongrid" and tron_limit > 0 and calls >= tron_limit:
+            tron += 1
+    return min(eth, eth_count) + min(tron, tron_count)
+
+
+def _heartbeat_times(path: Path) -> tuple[str, str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "—", "—"
+    health = payload.get("health") if isinstance(payload, dict) else None
+    if not isinstance(health, dict):
+        return "—", "—"
+    return _clock(health.get("last_api_success_at")), _clock(health.get("last_telegram_success_at"))
+
+
+def _clock(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "—"
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return "—"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
+
+
+def _directory_size(path: Path) -> str:
+    total = 0
+    try:
+        if path.is_dir():
+            for item in path.rglob("*"):
+                if item.is_file():
+                    total += item.stat().st_size
+    except OSError:
+        return "—"
+    megabytes = total / (1024 * 1024)
+    if megabytes >= 1:
+        return f"{megabytes:.1f} MB"
+    return f"{total / 1024:.1f} KB"
+
+
+def _disk_free(path: Path) -> str:
+    try:
+        target = path if path.exists() else path.parent
+        usage = shutil.disk_usage(target)
+    except OSError:
+        return "—"
+    if usage.total <= 0:
+        return "—"
+    free_gb = usage.free / (1024 ** 3)
+    percent = usage.free / usage.total * 100
+    return f"{free_gb:.1f} GB (%{percent:.0f})"
 
 
 def _connect(path: Path | None) -> sqlite3.Connection | None:

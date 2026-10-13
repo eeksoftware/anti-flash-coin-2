@@ -19,6 +19,7 @@ import shutil
 import signal
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import aiohttp
@@ -44,8 +45,10 @@ from blockchain.token_price import DexScreenerPriceClient
 from config import settings
 from models.transaction import TokenTransfer
 from monitor.approval_monitor import ApprovalMonitor
+from reporting.chat_store import ChatStore
 from reporting.weekly import WeeklyReporter
 from monitor.state_db import SUSPICIOUS_CLASSIFICATIONS, UserStateStore, skip_notification
+from notifications.fee_alerts import fee_action, quote_usd, stable_unit_price
 from monitor.wallet_monitor import WalletMonitorManager
 from monitor.wallet_store import WalletStateStore
 from notifications.telegram import (
@@ -179,6 +182,29 @@ def build_stats_report(operations, client):
                     "providers": api_providers, "primary_network": primary_network}}
 
 
+async def _transfer_usd(transfer, classification: str, price_client, price_cache: dict) -> Decimal | None:
+    """USD value for the fee cutoff. A missing market price returns None."""
+    price = stable_unit_price(
+        transfer.network, transfer.token_address, classification, transfer.token_symbol,
+    )
+    if price is None and transfer.network == "ethereum" and transfer.token_address:
+        address = str(transfer.token_address).lower()
+        now = time.monotonic()
+        cached = price_cache.get(address)
+        if cached is None or now - cached[0] >= 300:
+            fetched = None
+            try:
+                prices = await price_client.get_usd_prices([address])
+                fetched = prices.get(address)
+            except Exception:
+                logging.getLogger(__name__).warning("USD fiyatı alınamadı.")
+            price_cache[address] = (now, fetched)
+            price = fetched
+        else:
+            price = cached[1]
+    return quote_usd(transfer.amount, price)
+
+
 async def main() -> None:
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -252,6 +278,7 @@ async def main() -> None:
             tron_provider.health_state = health_state
             providers["tron"] = tron_provider
         price_client = DexScreenerPriceClient()
+        price_cache: dict[str, tuple[float, Decimal | None]] = {}
         token_analyzer = TokenAnalyzer()
         check_service = CheckService(providers, token_analyzer)
         telegram = None
@@ -260,105 +287,120 @@ async def main() -> None:
                 settings.telegram_bot_token,
                 settings.telegram_chat_id,
                 health_state,
+                chat_store=ChatStore(data_dir / "chat_messages.sqlite"),
             )
         else:
             logger.info("Telegram bildirimleri kapalı; bot bilgileri yapılandırılmamış.")
 
         async def handle_new_transfers(subscription, transfers: list[TokenTransfer]) -> None:
             for transfer in transfers:
-                analysis_started = time.perf_counter()
-                analysis = None
-                analysis_error = None
                 try:
-                    analysis = token_analyzer.analyze(transfer)
-                except Exception as exc:
-                    analysis_error = str(exc)
-                    logger.exception("Token transferi analiz edilemedi.")
-                processing_ms = (time.perf_counter() - analysis_started) * 1000
-
-                classification = analysis.classification if analysis is not None else "ERROR"
-                if operations:
-                    increments = [("transfer_total", "", 1), (f"classification:{classification}", "", 1)]
-                    if classification in SUSPICIOUS_CLASSIFICATIONS:
-                        increments.append(("suspicious_total", "", 1))
-                    if analysis_error:
-                        increments.append(("errors", "", 1))
-                    event_fingerprint = hashlib.sha256(repr(transfer.event_id).encode("utf-8")).hexdigest()
-                    operations.increment_many_once(event_fingerprint, increments)
-                label = CLASSIFICATION_LABELS.get(classification, "Analiz hatası")
-                logger.info(
-                    "%s %s %s olarak sınıflandırıldı: %s",
-                    "Alındı" if transfer.direction == "RECEIVE" else "Gönderildi",
-                    transfer.amount,
-                    transfer.token_symbol,
-                    label,
-                )
-
-                # Stage 7: risk signals sit beside the classification; they never change it.
-                audit_record = {
-                    "network": transfer.network,
-                    "tx_hash": transfer.tx_hash,
-                    "log_index": transfer.log_index,
-                    "event_key": transfer.event_key,
-                    "token_address": transfer.token_address,
-                    "wallet": subscription.wallet_address,
-                }
-                counterparty = transfer.sender if transfer.direction == "RECEIVE" else transfer.receiver
-                poisoning = None
-                if user_state is not None:
+                    analysis_started = time.perf_counter()
+                    analysis = None
+                    analysis_error = None
                     try:
-                        known = user_state.counterparties(transfer.network, subscription.wallet_address)
-                        poisoning = address_poisoning.evaluate(
-                            transfer.network, subscription.wallet_address, counterparty,
-                            transfer.amount, known, event_key=transfer.event_key,
-                        )
-                    except Exception:
-                        logger.warning("Adres benzerliği değerlendirilemedi.")
-                risk_signals = classification_signals(analysis, network=transfer.network, event_key=transfer.event_key)
-                if poisoning is not None:
-                    risk_signals.extend(poisoning.signals)
-                    logger.info("Adres benzerliği şüphesi | baş=%d | son=%d", poisoning.similarity.prefix, poisoning.similarity.suffix)
-                risk = compute_risk(risk_signals, missing=("classification",) if analysis is None else ())
-                if user_state is not None:
-                    try:
-                        fresh = user_state.save_detection(
-                            event_key=audit_event_key(audit_record), kind="risk", network=transfer.network,
-                            wallet_address=subscription.wallet_address, tx_hash=transfer.tx_hash,
-                            score=risk.score, level=risk.level, weights_version=risk.weights_version,
-                            signals=[{"name": s.name, "weight": s.weight, "verified": s.verified, "evidence": s.evidence} for s in risk.signals],
-                        )
-                        if fresh:
-                            user_state.record_counterparties(transfer.network, subscription.wallet_address, [counterparty], transfer.timestamp)
-                    except Exception:
-                        logger.warning("Risk tespiti kaydedilemedi.")
-                extra_suspicious = poisoning is not None or risk.level in {"YÜKSEK", "KRİTİK"}
+                        analysis = token_analyzer.analyze(transfer)
+                    except Exception as exc:
+                        analysis_error = str(exc)
+                        logger.exception("Token transferi analiz edilemedi.")
+                    processing_ms = (time.perf_counter() - analysis_started) * 1000
 
-                notified = None
-                telegram_message_id = None
-                notify_error = None
-                if analysis is not None and telegram is not None:
-                    recipient = subscription.user_id or settings.telegram_chat_id
-                    alias = None
-                    feedback_token = None
-                    send_alert = True
-                    if subscription.user_id and user_state is not None:
+                    classification = analysis.classification if analysis is not None else "ERROR"
+                    if operations:
+                        increments = [("transfer_total", "", 1), (f"classification:{classification}", "", 1)]
+                        if classification in SUSPICIOUS_CLASSIFICATIONS:
+                            increments.append(("suspicious_total", "", 1))
+                        if analysis_error:
+                            increments.append(("errors", "", 1))
+                        event_fingerprint = hashlib.sha256(repr(transfer.event_id).encode("utf-8")).hexdigest()
+                        operations.increment_many_once(event_fingerprint, increments)
+                    label = CLASSIFICATION_LABELS.get(classification, "Analiz hatası")
+                    logger.info(
+                        "%s %s %s olarak sınıflandırıldı: %s",
+                        "Alındı" if transfer.direction == "RECEIVE" else "Gönderildi",
+                        transfer.amount,
+                        transfer.token_symbol,
+                        label,
+                    )
+
+                    # Stage 7: risk signals sit beside the classification; they never change it.
+                    audit_record = {
+                        "network": transfer.network,
+                        "tx_hash": transfer.tx_hash,
+                        "log_index": transfer.log_index,
+                        "event_key": transfer.event_key,
+                        "token_address": transfer.token_address,
+                        "wallet": subscription.wallet_address,
+                    }
+                    counterparty = transfer.sender if transfer.direction == "RECEIVE" else transfer.receiver
+                    poisoning = None
+                    if user_state is not None:
                         try:
-                            prefs = user_state.settings(
-                                subscription.user_id, transfer.network, subscription.wallet_address,
+                            known = user_state.counterparties(transfer.network, subscription.wallet_address)
+                            poisoning = address_poisoning.evaluate(
+                                transfer.network, subscription.wallet_address, counterparty,
+                                transfer.amount, known, event_key=transfer.event_key,
                             )
                         except Exception:
-                            logger.warning("Cüzdan ayarları okunamadı; varsayılan bildirim kullanılacak.")
-                            prefs = None
-                        if prefs is not None:
-                            alias = prefs.alias or None
-                            reason = skip_notification(
-                                classification, transfer.amount, prefs, datetime.now(timezone.utc),
-                                extra_suspicious=extra_suspicious,
+                            logger.warning("Adres benzerliği değerlendirilemedi.")
+                    risk_signals = classification_signals(analysis, network=transfer.network, event_key=transfer.event_key)
+                    if poisoning is not None:
+                        risk_signals.extend(poisoning.signals)
+                        logger.info("Adres benzerliği şüphesi | baş=%d | son=%d", poisoning.similarity.prefix, poisoning.similarity.suffix)
+                    risk = compute_risk(risk_signals, missing=("classification",) if analysis is None else ())
+                    if user_state is not None:
+                        try:
+                            fresh = user_state.save_detection(
+                                event_key=audit_event_key(audit_record), kind="risk", network=transfer.network,
+                                wallet_address=subscription.wallet_address, tx_hash=transfer.tx_hash,
+                                score=risk.score, level=risk.level, weights_version=risk.weights_version,
+                                signals=[{"name": s.name, "weight": s.weight, "verified": s.verified, "evidence": s.evidence} for s in risk.signals],
                             )
-                            if reason:
+                            if fresh:
+                                user_state.record_counterparties(transfer.network, subscription.wallet_address, [counterparty], transfer.timestamp)
+                        except Exception:
+                            logger.warning("Risk tespiti kaydedilemedi.")
+                    extra_suspicious = poisoning is not None or risk.level in {"YÜKSEK", "KRİTİK"}
+
+                    notified = None
+                    telegram_message_id = None
+                    notify_error = None
+                    if analysis is not None and telegram is not None:
+                        recipient = subscription.user_id or settings.telegram_chat_id
+                        alias = None
+                        feedback_token = None
+                        prefs = None
+                        send_alert = True
+                        fee_kind = None
+                        if subscription.user_id and user_state is not None:
+                            try:
+                                prefs = user_state.settings(
+                                    subscription.user_id, transfer.network, subscription.wallet_address,
+                                )
+                            except Exception:
+                                logger.warning("Cüzdan ayarları okunamadı; varsayılan bildirim kullanılacak.")
+                                prefs = None
+                            if prefs is not None:
+                                alias = prefs.alias or None
+                                reason = skip_notification(
+                                    classification, transfer.amount, prefs, datetime.now(timezone.utc),
+                                    extra_suspicious=extra_suspicious,
+                                )
+                                if reason:
+                                    send_alert = False
+                                    logger.info("Bildirim atlandı | neden=%s", reason)
+                        if send_alert:
+                            suspicious = extra_suspicious or classification in SUSPICIOUS_CLASSIFICATIONS
+                            usd = await _transfer_usd(transfer, classification, price_client, price_cache)
+                            fee_kind = fee_action(
+                                usd,
+                                suspicious=suspicious,
+                                notify_fees=bool(prefs and prefs.fee_alerts),
+                            )
+                            if fee_kind == "skip":
                                 send_alert = False
-                                logger.info("Bildirim atlandı | neden=%s", reason)
-                            else:
+                                logger.info("Bildirim atlandı | neden=fee")
+                            elif fee_kind != "fee" and prefs is not None and subscription.user_id and user_state is not None:
                                 try:
                                     feedback_token = user_state.register_alert(
                                         user_id=subscription.user_id,
@@ -369,85 +411,102 @@ async def main() -> None:
                                     )
                                 except Exception:
                                     logger.warning("Geri bildirim kaydı oluşturulamadı.")
-                    if send_alert and recipient:
-                        try:
-                            result = await telegram.send_transfer_alert(
-                                transfer,
-                                analysis,
-                                chat_id=recipient,
-                                alias=alias,
-                                feedback_token=feedback_token,
-                                risk=risk,
-                                poisoning=poisoning,
-                            )
-                            notified = True
-                            if operations: operations.increment("notifications_sent")
-                            if isinstance(result, dict):
-                                telegram_message_id = result.get("message_id")
-                        except Exception as exc:
-                            notified = False
-                            if operations: operations.increment("errors")
-                            notify_error = str(exc)
-                            logger.error("Telegram bildirimi gönderilemedi: %s", exc)
+                        if send_alert and recipient:
+                            try:
+                                address_names = {}
+                                if transfer.network == "ethereum" and client is not None:
+                                    address_names = await client.get_address_tags([
+                                        transfer.sender, transfer.receiver, transfer.token_address,
+                                    ])
+                                if fee_kind == "fee":
+                                    result = await telegram.send_fee_alert(
+                                        transfer, usd, chat_id=recipient, alias=alias, address_names=address_names,
+                                    )
+                                else:
+                                    result = await telegram.send_transfer_alert(
+                                        transfer,
+                                        analysis,
+                                        chat_id=recipient,
+                                        alias=alias,
+                                        feedback_token=feedback_token,
+                                        risk=risk,
+                                        poisoning=poisoning,
+                                        address_names=address_names,
+                                    )
+                                notified = True
+                                if operations: operations.increment("notifications_sent")
+                                if isinstance(result, dict):
+                                    telegram_message_id = result.get("message_id")
+                            except Exception as exc:
+                                notified = False
+                                if operations: operations.increment("errors")
+                                notify_error = str(exc)
+                                logger.error("Telegram bildirimi gönderilemedi: %s", exc)
 
-                recorded_at = datetime.now(timezone.utc)
-                block_time = transfer.timestamp
-                if block_time.tzinfo is None:
-                    block_time = block_time.replace(tzinfo=timezone.utc)
-                detection_latency_s = (
-                    max(
-                        0.0,
-                        (recorded_at - block_time.astimezone(timezone.utc)).total_seconds(),
-                    )
-                    if classification != "CANONICAL"
-                    else None
-                )
-                signals = [signal.name for signal in risk.signals]
-                log_transaction({
-                    "ts": recorded_at,
-                    "source": "monitor",
-                    "network": transfer.network,
-                    "tx_hash": transfer.tx_hash,
-                    "log_index": transfer.log_index,
-                    "event_key": transfer.event_key,
-                    "block_number": transfer.block_number,
-                    "block_time": block_time,
-                    "direction": transfer.direction,
-                    "wallet": subscription.wallet_address,
-                    "sender": transfer.sender,
-                    "receiver": transfer.receiver,
-                    "token_address": transfer.token_address,
-                    "token_symbol": transfer.token_symbol,
-                    "amount": format(transfer.amount, "f"),
-                    "classification": classification,
-                    "classification_label": label,
-                    "signals": list(signals),
-                    "notified": notified,
-                    "telegram_message_id": telegram_message_id,
-                    "notify_error": notify_error,
-                    "detection_latency_s": round(detection_latency_s, 3),
-                    "processing_ms": round(processing_ms, 3),
-                    "expected": None,
-                    "confirmed": transfer.confirmed,
-                    "error": analysis_error,
-                })
-                if user_state is not None:
-                    try:
-                        user_state.record_report_transfer(
-                            event_key=audit_event_key(audit_record),
-                            network=transfer.network,
-                            wallet_address=subscription.wallet_address,
-                            tx_hash=transfer.tx_hash,
-                            direction=transfer.direction,
-                            token_symbol=transfer.token_symbol,
-                            token_name=transfer.token_name,
-                            amount=format(transfer.amount, "f"),
-                            classification=classification,
-                            block_time=block_time.astimezone(timezone.utc).isoformat(),
-                            notified=notified,
+                    recorded_at = datetime.now(timezone.utc)
+                    block_time = transfer.timestamp
+                    if block_time.tzinfo is None:
+                        block_time = block_time.replace(tzinfo=timezone.utc)
+                    detection_latency_s = (
+                        max(
+                            0.0,
+                            (recorded_at - block_time.astimezone(timezone.utc)).total_seconds(),
                         )
-                    except Exception:
-                        logger.warning("Rapor kaydı yazılamadı.")
+                        if classification != "CANONICAL"
+                        else None
+                    )
+                    signals = [signal.name for signal in risk.signals]
+                    log_transaction({
+                        "ts": recorded_at,
+                        "source": "monitor",
+                        "network": transfer.network,
+                        "tx_hash": transfer.tx_hash,
+                        "log_index": transfer.log_index,
+                        "event_key": transfer.event_key,
+                        "block_number": transfer.block_number,
+                        "block_time": block_time,
+                        "direction": transfer.direction,
+                        "wallet": subscription.wallet_address,
+                        "sender": transfer.sender,
+                        "receiver": transfer.receiver,
+                        "token_address": transfer.token_address,
+                        "token_symbol": transfer.token_symbol,
+                        "amount": format(transfer.amount, "f"),
+                        "classification": classification,
+                        "classification_label": label,
+                        "signals": list(signals),
+                        "notified": notified,
+                        "telegram_message_id": telegram_message_id,
+                        "notify_error": notify_error,
+                        "detection_latency_s": None if detection_latency_s is None else round(detection_latency_s, 3),
+                        "processing_ms": round(processing_ms, 3),
+                        "expected": None,
+                        "confirmed": transfer.confirmed,
+                        "error": analysis_error,
+                    })
+                    if user_state is not None:
+                        try:
+                            user_state.record_report_transfer(
+                                event_key=audit_event_key(audit_record),
+                                network=transfer.network,
+                                wallet_address=subscription.wallet_address,
+                                tx_hash=transfer.tx_hash,
+                                direction=transfer.direction,
+                                token_symbol=transfer.token_symbol,
+                                token_name=transfer.token_name,
+                                amount=format(transfer.amount, "f"),
+                                classification=classification,
+                                block_time=block_time.astimezone(timezone.utc).isoformat(),
+                                notified=notified,
+                            )
+                        except Exception:
+                            logger.warning("Rapor kaydı yazılamadı.")
+                except Exception:
+                    logger.exception(
+                        "Transfer işlenemedi | ağ=%s | tx=%s",
+                        transfer.network,
+                        transfer.tx_hash,
+                    )
 
         async def seed_address_history(network: str, wallet_address: str, transfers: list[TokenTransfer]) -> None:
             """Baseline transfers fill the counterparty history; they are not alerts."""

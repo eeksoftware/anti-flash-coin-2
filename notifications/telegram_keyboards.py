@@ -2,7 +2,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from monitor.state_db import feedback_callback
+from monitor.state_db import feedback_callback, parse_feedback_callback
 from networks import get_enabled_networks, get_network_config
 
 
@@ -37,6 +37,7 @@ WALLET_SUSPICIOUS_PREFIX = "w:so:"
 WALLET_QUIET_PREFIX = "w:qh:"
 WALLET_QUIET_CLEAR_PREFIX = "w:qc:"
 WALLET_WEEKLY_PREFIX = "w:wr:"
+WALLET_FEE_PREFIX = "w:fe:"
 EXPORT_24H = "export:24h"
 EXPORT_7D = "export:7d"
 EXPORT_30D = "export:30d"
@@ -186,6 +187,7 @@ def wallet_settings_keyboard(address: str, network: str = "ethereum") -> InlineK
             callback_button("🔔 Sessizi kapat", f"{WALLET_QUIET_CLEAR_PREFIX}{value}"),
         ],
         [callback_button("🗓️ Haftalık özet", f"{WALLET_WEEKLY_PREFIX}{value}")],
+        [callback_button("💸 Fee bildirimi", f"{WALLET_FEE_PREFIX}{value}")],
         [callback_button("⬅️ Cüzdanlarım", MENU_WALLETS)],
     ])
 
@@ -210,6 +212,74 @@ def approval_alert_keyboard(network: str, tx_hash: str, token_address: str, wall
     ]])
 
 
+_FEEDBACK_BUTTONS = {
+    "CORRECT": "👍 Doğru tespit",
+    "FALSE_POSITIVE": "👎 Yanlış alarm",
+    "UNSURE": "❓ Emin değilim",
+}
+_FEEDBACK_SELECTED = {
+    "CORRECT": "✅ Doğru tespit",
+    "FALSE_POSITIVE": "✅ Yanlış alarm",
+    "UNSURE": "✅ Emin değilim",
+}
+_FEEDBACK_STATUS = {
+    "CORRECT": "✅ Geri bildirim: Doğru tespit",
+    "FALSE_POSITIVE": "✅ Geri bildirim: Yanlış alarm",
+    "UNSURE": "✅ Geri bildirim: Emin değilim",
+}
+
+
+def without_feedback_status(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    for existing in _FEEDBACK_STATUS.values():
+        suffix = "\n\n" + existing
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def with_feedback_status(text: str, kind: str) -> str | None:
+    """Append one feedback line, replacing a previous choice."""
+    line = _FEEDBACK_STATUS.get(kind)
+    if line is None or not isinstance(text, str) or not text:
+        return None
+    updated = f"{without_feedback_status(text)}\n\n{line}"
+    if len(updated) > 4096:
+        return None
+    return updated
+
+
+def mark_selected_feedback(markup: InlineKeyboard | None, kind: str) -> InlineKeyboard | None:
+    """Return the same keyboard with the chosen feedback button checked."""
+    if kind not in _FEEDBACK_BUTTONS or not isinstance(markup, dict):
+        return None
+    rows = markup.get("inline_keyboard")
+    if not isinstance(rows, list):
+        return None
+    found = False
+    updated_rows = []
+    for row in rows:
+        if not isinstance(row, list):
+            return None
+        updated_row = []
+        for button in row:
+            if not isinstance(button, dict):
+                return None
+            parsed = parse_feedback_callback(str(button.get("callback_data", "")))
+            if parsed is None:
+                updated_row.append(button)
+                continue
+            button_kind, _token = parsed
+            text = _FEEDBACK_SELECTED[button_kind] if button_kind == kind else _FEEDBACK_BUTTONS[button_kind]
+            updated_row.append({**button, "text": text})
+            found = True
+        updated_rows.append(updated_row)
+    if not found:
+        return None
+    return {"inline_keyboard": updated_rows}
+
+
 def transfer_alert_keyboard(
     network: str,
     tx_hash: str,
@@ -228,8 +298,8 @@ def transfer_alert_keyboard(
     ]]
     if feedback_token and re.fullmatch(r"[0-9a-f]{16}", feedback_token):
         rows.append([
-            callback_button("👍 Doğru tespit", feedback_callback("CORRECT", feedback_token)),
-            callback_button("👎 Yanlış alarm", feedback_callback("FALSE_POSITIVE", feedback_token)),
-            callback_button("❓ Emin değilim", feedback_callback("UNSURE", feedback_token)),
+            callback_button(_FEEDBACK_BUTTONS["CORRECT"], feedback_callback("CORRECT", feedback_token)),
+            callback_button(_FEEDBACK_BUTTONS["FALSE_POSITIVE"], feedback_callback("FALSE_POSITIVE", feedback_token)),
+            callback_button(_FEEDBACK_BUTTONS["UNSURE"], feedback_callback("UNSURE", feedback_token)),
         ])
     return inline_keyboard(rows)

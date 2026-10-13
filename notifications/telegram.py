@@ -70,6 +70,7 @@ from notifications.telegram_formatter import (
     format_token_check,
     format_tx_check,
     format_approval_alert,
+    format_fee_alert,
     format_transfer_alert,
     format_wallet_list,
     format_wallet_settings,
@@ -103,6 +104,7 @@ from notifications.telegram_keyboards import (
     WALLET_REMOVE_PREFIX,
     WALLET_SETTINGS_PREFIX,
     WALLET_SUSPICIOUS_PREFIX,
+    WALLET_FEE_PREFIX,
     WALLET_WEEKLY_PREFIX,
     EXPORT_24H,
     EXPORT_7D,
@@ -111,10 +113,39 @@ from notifications.telegram_keyboards import (
     cancel_keyboard,
     history_result_keyboard,
     main_menu_keyboard,
+    mark_selected_feedback,
+    with_feedback_status,
+    without_feedback_status,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _utf16_length(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _entities_within(entities: Any, text: str) -> list[dict[str, Any]] | None:
+    """Keep message entities that still fall inside the original alert text."""
+    if not isinstance(entities, list):
+        return None
+    limit = _utf16_length(text)
+    kept: list[dict[str, Any]] = []
+    for entity in entities:
+        if not isinstance(entity, dict) or not isinstance(entity.get("type"), str):
+            continue
+        offset = entity.get("offset")
+        length = entity.get("length")
+        if (
+            isinstance(offset, int)
+            and isinstance(length, int)
+            and offset >= 0
+            and length > 0
+            and offset + length <= limit
+        ):
+            kept.append(entity)
+    return kept or None
 
 
 def format_activity_notice(sender: dict[str, Any], body: str) -> str:
@@ -161,13 +192,40 @@ class PendingExport:
     expires_at: float
 
 
+async def _ethereum_address_names(check_service, result) -> dict[str, str]:
+    """Name tags for an Ethereum check. Other networks and API failures stay unlabeled."""
+    if check_service is None or getattr(result, "network", "") != "ethereum":
+        return {}
+    provider = getattr(check_service, "providers", {}).get("ethereum")
+    client = getattr(provider, "client", None)
+    lookup = getattr(client, "get_address_tags", None)
+    if lookup is None:
+        return {}
+    addresses = []
+    transaction = getattr(result, "transaction", None)
+    if transaction is not None:
+        addresses.extend([transaction.from_address, transaction.to_address])
+    for item in getattr(result, "transfers", ()) or ():
+        transfer = getattr(item, "transfer", None)
+        if transfer is None:
+            continue
+        addresses.extend([transfer.sender, transfer.receiver, transfer.token_address])
+    try:
+        names = await lookup([address for address in addresses if address])
+    except Exception:
+        logger.warning("Adres adı alınamadı.")
+        return {}
+    return names if isinstance(names, dict) else {}
+
+
 class TelegramNotifier:
     BASE_URL = "https://api.telegram.org"
 
-    def __init__(self, bot_token: str, chat_id: str = "", health_state=None) -> None:
+    def __init__(self, bot_token: str, chat_id: str = "", health_state=None, chat_store=None) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.health_state = health_state
+        self.chat_store = chat_store
         self.session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
@@ -223,7 +281,9 @@ class TelegramNotifier:
         if self.health_state is not None:
             self.health_state.last_telegram_success_at = datetime.now(timezone.utc)
         result = response.get("result")
-        return result if isinstance(result, dict) else {}
+        sent = result if isinstance(result, dict) else {}
+        self._remember_out(payload["chat_id"], sent, message.text)
+        return sent
 
     async def send_text(
         self,
@@ -242,7 +302,9 @@ class TelegramNotifier:
             payload["parse_mode"] = parse_mode
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
-        await self.call_api("sendMessage", payload)
+        response = await self.call_api("sendMessage", payload)
+        result = response.get("result") if isinstance(response, dict) else None
+        self._remember_out(payload["chat_id"], result if isinstance(result, dict) else {}, text)
         if self.health_state is not None:
             self.health_state.last_telegram_success_at = datetime.now(timezone.utc)
 
@@ -288,8 +350,40 @@ class TelegramNotifier:
             "reply_markup": message.reply_markup or {"inline_keyboard": []},
         }
         await self.call_api("editMessageText", payload, ignore_not_modified=True)
+        self._revise_out(chat_id, message_id, message.text)
         if self.health_state is not None:
             self.health_state.last_telegram_success_at = datetime.now(timezone.utc)
+
+    async def edit_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+        entities: list[dict[str, Any]] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "link_preview_options": {"is_disabled": True},
+            "reply_markup": reply_markup or {"inline_keyboard": []},
+        }
+        if entities:
+            payload["entities"] = entities
+        await self.call_api("editMessageText", payload, ignore_not_modified=True)
+
+    async def edit_reply_markup(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        reply_markup: dict[str, Any],
+    ) -> None:
+        await self.call_api(
+            "editMessageReplyMarkup",
+            {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup},
+            ignore_not_modified=True,
+        )
 
     async def answer_callback_query(
         self,
@@ -314,9 +408,27 @@ class TelegramNotifier:
         feedback_token: str | None = None,
         risk=None,
         poisoning=None,
+        address_names: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         return await self.send_formatted(
-            format_transfer_alert(transfer, analysis, alias=alias, feedback_token=feedback_token, risk=risk, poisoning=poisoning),
+            format_transfer_alert(
+                transfer, analysis, alias=alias, feedback_token=feedback_token,
+                risk=risk, poisoning=poisoning, address_names=address_names,
+            ),
+            chat_id,
+        )
+
+    async def send_fee_alert(
+        self,
+        transfer: TokenTransfer,
+        usd,
+        chat_id: str | int | None = None,
+        *,
+        alias: str | None = None,
+        address_names: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return await self.send_formatted(
+            format_fee_alert(transfer, usd, alias=alias, address_names=address_names),
             chat_id,
         )
 
@@ -342,9 +454,45 @@ class TelegramNotifier:
     ) -> None:
         await self.send_formatted(format_api_status(status), chat_id)
 
+    def _remember_out(self, chat_id, result: dict, text: str) -> None:
+        if self.chat_store is None or not isinstance(result, dict):
+            return
+        message_id = result.get("message_id")
+        if not isinstance(message_id, int):
+            return
+        sender = result.get("from") if isinstance(result.get("from"), dict) else {}
+        name = str(sender.get("first_name") or "Bot")
+        try:
+            self.chat_store.add(
+                chat_id=str(chat_id),
+                message_id=message_id,
+                direction="out",
+                user_id=str(sender.get("id") or ""),
+                sender_name=name,
+                username=str(sender.get("username") or ""),
+                body=text,
+                sent_at=_message_time(result.get("date")),
+            )
+        except Exception:
+            logger.warning("Sohbet kaydı yazılamadı.")
+
+    def _revise_out(self, chat_id, message_id: int, text: str) -> None:
+        if self.chat_store is None or not isinstance(message_id, int):
+            return
+        try:
+            self.chat_store.revise(str(chat_id), message_id, text)
+        except Exception:
+            logger.warning("Sohbet kaydı güncellenemedi.")
+
     async def close(self) -> None:
         if self.session is not None and not self.session.closed:
             await self.session.close()
+
+
+def _message_time(value) -> str:
+    if isinstance(value, int):
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 class TelegramBotController:
@@ -505,6 +653,7 @@ class TelegramBotController:
             return
         chat_id = str(chat.get("id"))
         user_id = str(sender.get("id"))
+        self._remember_incoming(message, chat_id, sender, text)
         chat_type = chat.get("type")
         parts = text.strip().split()
         if not parts:
@@ -608,6 +757,28 @@ class TelegramBotController:
                 await self._run_export(user_id, chat_id, parts[1:])
         else:
             logger.info("Bilinmeyen Telegram komutu yok sayıldı.")
+
+    def _remember_incoming(self, message: dict, chat_id: str, sender: dict, text: str) -> None:
+        store = getattr(self.notifier, "chat_store", None)
+        message_id = message.get("message_id")
+        if store is None or not isinstance(message_id, int):
+            return
+        first = str(sender.get("first_name") or "")
+        last = str(sender.get("last_name") or "")
+        name = " ".join(part for part in (first, last) if part)
+        try:
+            store.add(
+                chat_id=chat_id,
+                message_id=message_id,
+                direction="in",
+                user_id=str(sender.get("id") or ""),
+                sender_name=name,
+                username=str(sender.get("username") or ""),
+                body=text,
+                sent_at=_message_time(message.get("date")),
+            )
+        except Exception:
+            logger.warning("Sohbet kaydı yazılamadı.")
 
     async def _accept_pending_address(
         self,
@@ -810,13 +981,14 @@ class TelegramBotController:
             else:
                 result = await self.check_service.check_transaction(request.network, request.value)
                 eth_usd_price = None
-                if result.transaction is not None and result.transaction.native_value > 0:
+                if result.network == "ethereum" and result.transaction is not None and result.transaction.native_value > 0:
                     try:
                         prices = await self.price_client.get_usd_prices([ETHEREUM_WETH_ADDRESS])
                         eth_usd_price = prices.get(ETHEREUM_WETH_ADDRESS)
                     except Exception:
                         logger.warning("Native ETH için USD fiyatı alınamadı.")
-                message = format_tx_check(result, eth_usd_price=eth_usd_price)
+                address_names = await _ethereum_address_names(self.check_service, result)
+                message = format_tx_check(result, eth_usd_price=eth_usd_price, address_names=address_names)
         except (EtherscanRateLimitError, TronGridRateLimitError):
             if self.operations_store is not None: self.operations_store.increment("errors")
             message = format_check_error("rate_limit")
@@ -832,10 +1004,20 @@ class TelegramBotController:
             message = format_check_error("provider")
             outcome = "Tamamlanamadı"
         else:
-            classification = (
-                result.analysis.classification if result.analysis is not None else "ERROR"
-            ) if request.kind == "token" else result.classification
-            outcome = CLASSIFICATION_LABELS.get(classification, classification)
+            transaction = getattr(result, "transaction", None)
+            native_only = (
+                request.kind != "token"
+                and transaction is not None
+                and transaction.native_value > 0
+                and not result.transfers
+            )
+            if native_only and transaction.status == "success":
+                outcome = "TRX transferi" if result.network == "tron" else "ETH transferi"
+            else:
+                classification = (
+                    result.analysis.classification if result.analysis is not None else "ERROR"
+                ) if request.kind == "token" else result.classification
+                outcome = CLASSIFICATION_LABELS.get(classification, classification)
         await self._show_formatted(chat_id, message, progress_message_id)
         kind = "Token" if request.kind == "token" else "İşlem"
         await self._report_activity(
@@ -1143,6 +1325,7 @@ class TelegramBotController:
             WALLET_QUIET_PREFIX,
             WALLET_QUIET_CLEAR_PREFIX,
             WALLET_WEEKLY_PREFIX,
+            WALLET_FEE_PREFIX,
         ))
 
     async def _handle_settings_callback(self, data, user_id, chat_id, message_id, wallets) -> None:
@@ -1159,6 +1342,8 @@ class TelegramBotController:
             prefix, field = WALLET_QUIET_CLEAR_PREFIX, "quiet_clear"
         elif data.startswith(WALLET_WEEKLY_PREFIX):
             prefix, field = WALLET_WEEKLY_PREFIX, "weekly"
+        elif data.startswith(WALLET_FEE_PREFIX):
+            prefix, field = WALLET_FEE_PREFIX, "fee"
         elif data.startswith(WALLET_QUIET_PREFIX):
             prefix, field = WALLET_QUIET_PREFIX, "quiet"
         else:
@@ -1196,6 +1381,8 @@ class TelegramBotController:
             updated = replace(prefs, suspicious_only=not prefs.suspicious_only)
         elif field == "weekly":
             updated = replace(prefs, weekly_report=not prefs.weekly_report)
+        elif field == "fee":
+            updated = replace(prefs, fee_alerts=not prefs.fee_alerts)
         else:
             updated = replace(prefs, quiet_start=None, quiet_end=None)
         try:
@@ -1277,17 +1464,52 @@ class TelegramBotController:
             await self._answer_feedback(callback_id, "Geri bildirim kaydedilemedi.")
             return
         if result == "unchanged":
-            await self._answer_feedback(callback_id, "Geri bildirimin zaten kayıtlı.")
+            await self._answer_feedback(callback_id, "Geri bildirimin zaten kayıtlı.", show_alert=True)
+            await self._show_feedback_choice(message, kind)
         elif result == "updated":
-            await self._answer_feedback(callback_id, "Geri bildirimin kaydedildi.")
+            await self._answer_feedback(callback_id, "Geri bildirimin kaydedildi.", show_alert=True)
+            await self._show_feedback_choice(message, kind)
         elif result == "unauthorized":
             await self._answer_feedback(callback_id, "Bu işlem için yetkin yok.")
         else:
             await self._answer_feedback(callback_id, "Bu geri bildirim geçersiz.")
 
-    async def _answer_feedback(self, callback_id: str, text: str) -> None:
+    async def _show_feedback_choice(self, message, kind: str) -> None:
+        if not isinstance(message, dict):
+            return
+        chat = message.get("chat")
+        message_id = message.get("message_id")
+        if not isinstance(chat, dict) or not isinstance(message_id, int):
+            return
+        chat_id = chat.get("id")
+        markup = mark_selected_feedback(message.get("reply_markup"), kind)
+        original = message.get("text")
+        updated_text = with_feedback_status(original, kind) if isinstance(original, str) else None
+        base = without_feedback_status(original) if isinstance(original, str) else ""
+        edit_text = getattr(self.notifier, "edit_text", None)
+        if updated_text is not None and edit_text is not None:
+            try:
+                await edit_text(
+                    chat_id,
+                    message_id,
+                    updated_text,
+                    markup or message.get("reply_markup") or {"inline_keyboard": []},
+                    _entities_within(message.get("entities"), base),
+                )
+                return
+            except TelegramError:
+                logger.warning("Geri bildirim mesajı güncellenemedi.")
+        edit_markup = getattr(self.notifier, "edit_reply_markup", None)
+        if markup is None or edit_markup is None:
+            return
         try:
-            await self.notifier.answer_callback_query(callback_id, text)
+            await edit_markup(chat_id, message_id, markup)
+        except TelegramError:
+            logger.warning("Geri bildirim düğmeleri güncellenemedi.")
+
+    async def _answer_feedback(self, callback_id: str, text: str, show_alert: bool = False) -> None:
+        try:
+            await self.notifier.answer_callback_query(callback_id, text, show_alert=show_alert)
         except TelegramError:
             logger.warning("Geri bildirim yanıtı gönderilemedi.")
 

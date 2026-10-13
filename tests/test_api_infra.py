@@ -44,6 +44,37 @@ def test_cache_ttl_lru_and_pending_skip():
     assert cache.get("b") is None
 
 
+def test_calls_past_five_per_second_wait_in_line():
+    now = [0.0]
+
+    async def sleep(delay):
+        now[0] += delay
+
+    pool = RateLimitedPool(
+        ["only"],
+        {"rate": 100, "burst": 10, "max_per_second": 5},
+        clock=lambda: now[0],
+        sleeper=sleep,
+        jitter=lambda: 0,
+    )
+
+    async def run():
+        times = []
+        for _ in range(8):
+            lease = await pool.acquire()
+            times.append(now[0])
+            pool.report(lease, Outcome.OK)
+        return times
+
+    times = asyncio.run(run())
+    gaps = [later - earlier for earlier, later in zip(times, times[1:])]
+    assert min(gaps) >= 0.2
+    assert times[5] - times[0] >= 1
+    for index, moment in enumerate(times):
+        inside = [item for item in times if moment <= item <= moment + 1]
+        assert len(inside) <= 5, index
+
+
 def test_rate_limited_key_enters_cooldown():
     now = [0.0]
     async def sleep(delay): now[0] += delay

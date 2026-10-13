@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
 
-from infra.rate_limiter import TokenBucket
+from infra.rate_limiter import DepartureQueue, TokenBucket
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ class _Key:
     label: str
     secret: Secret
     bucket: TokenBucket
+    gate: DepartureQueue | None = None
     cooldown_until: float = 0.0
     cooldown: float = 2.0
     disabled: bool = False
@@ -70,7 +71,26 @@ class RateLimitedPool:
         rate = limits.get("rate", 4)
         burst = limits.get("burst", 2)
         label_prefix = str(limits.get("key_label_prefix", "key"))
-        self._keys = [_Key(f"{label_prefix}-{i+1}", k if isinstance(k, Secret) else Secret(str(k)), TokenBucket(rate, burst, clock, sleeper)) for i, k in enumerate(keys) if k]
+        ceiling = limits.get("max_per_second")
+        self._ceiling = float(ceiling) if ceiling else None
+        if self._ceiling is not None:
+            if self._ceiling <= 0:
+                raise ValueError("max_per_second must be positive")
+            rate = self._ceiling
+            burst = 1
+        label_prefix = str(limits.get("key_label_prefix", "key"))
+        self._keys = []
+        for i, raw_key in enumerate(keys):
+            if not raw_key:
+                continue
+            gate = DepartureQueue(self._ceiling, clock, sleeper) if self._ceiling is not None else None
+            secret = raw_key if isinstance(raw_key, Secret) else Secret(str(raw_key))
+            self._keys.append(_Key(
+                f"{label_prefix}-{i+1}",
+                secret,
+                TokenBucket(rate, burst, clock, sleeper),
+                gate,
+            ))
         self._condition = asyncio.Condition()
         self._waiters = {Priority.INTERACTIVE: 0, Priority.BACKGROUND: 0}
         self._background_wait_started: float | None = None
@@ -141,8 +161,12 @@ class RateLimitedPool:
                     raise PoolExhausted(f"{self._api_label} API anahtarı için bekleme süresi doldu.")
                 await self._sleep(delay)
             waited = self._clock()-started
-            if self._metrics: self._metrics.record_wait(waited)
-            await key.bucket.acquire()
+            if key.gate is not None:
+                await key.gate.acquire()
+            else:
+                await key.bucket.acquire()
+            if self._metrics:
+                self._metrics.record_wait(self._clock() - started)
             return lease
         finally:
             self._waiters[priority] -= 1
