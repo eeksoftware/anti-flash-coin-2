@@ -60,9 +60,11 @@ const BODY_X0 = -2.4;
 const BODY_X1 = 1.25;
 const TAIL_X = 1.55;
 
-const RY = [0.07, 0.22, 0.32, 0.38, 0.36, 0.29, 0.2, 0.14, 0.1, 0.07, 0.05];
-const RZ = [0.05, 0.14, 0.2, 0.23, 0.22, 0.17, 0.12, 0.07, 0.034, 0.018, 0.009];
+const RY = [0.095, 0.22, 0.32, 0.38, 0.36, 0.29, 0.2, 0.14, 0.1, 0.07, 0.05];
+const RZ = [0.068, 0.14, 0.2, 0.23, 0.22, 0.17, 0.12, 0.07, 0.034, 0.018, 0.009];
 const YC = [0.0, 0.02, 0.03, 0.02, 0.0, -0.02, -0.02, 0.0, 0.02, 0.03, 0.04];
+const HEAD_CAP = 0.08;
+const EYE_PATCH = { t: 0.19, theta: 0.3, ht: 0.05, hth: 0.3, tilt: 4 };
 const WHITE_LIMIT = [0.48, 0.62, 0.72, 0.74, 0.66, 0.52, 0.4, 0.3, 0.22, 0.16, 0.12];
 
 const INK = new THREE.Color(CONFIG.colors.ink);
@@ -286,6 +288,29 @@ function smoothstep(edge0, edge1, x) {
   return t * t * (3 - 2 * t);
 }
 
+function bodyRound(t) {
+  let round = 1;
+  if (t < HEAD_CAP) round = Math.sqrt(1 - (1 - t / HEAD_CAP) ** 2);
+  if (t > 0.9) round *= Math.cos(((t - 0.9) / 0.1) * Math.PI * 0.5);
+  return Math.max(round, 0.002);
+}
+
+function bodyPoint(t, theta, lift) {
+  const round = bodyRound(t);
+  const ry = spline(RY, t) * round;
+  const rz = spline(RZ, t) * round;
+  const s = Math.sin(theta);
+  const c = Math.cos(theta);
+  const yy = s >= 0 ? ry * s : ry * 0.72 * s;
+  return [
+    BODY_X0 + (BODY_X1 - BODY_X0) * t,
+    spline(YC, t) + yy + s * lift,
+    rz * c + c * lift,
+    s,
+    c,
+  ];
+}
+
 function buildBody() {
   const SEG = 240;
   const RING = 84;
@@ -295,10 +320,7 @@ function buildBody() {
   for (let i = 0; i <= SEG; i += 1) {
     const t = i / SEG;
     const x = BODY_X0 + (BODY_X1 - BODY_X0) * t;
-    let round = 1;
-    if (t < 0.08) round = Math.sin((t / 0.08) * Math.PI * 0.5);
-    if (t > 0.9) round *= Math.cos(((t - 0.9) / 0.1) * Math.PI * 0.5);
-    round = Math.max(round, 0.002);
+    const round = bodyRound(t);
     const ry = spline(RY, t) * round;
     const rz = spline(RZ, t) * round;
     const yc = spline(YC, t);
@@ -315,9 +337,9 @@ function buildBody() {
       shade = Math.max(shade, 0.7 * lateral);
       const belly = smoothstep(limit + 0.1, limit - 0.22, phi);
       shade = shade * (1 - belly) + 0.98 * belly;
-      const patchPhi = 1.55 + (t - 0.16) * 2.4;
-      const eye = ((t - 0.16) / 0.07) ** 2 + ((phi - patchPhi) / 0.22) ** 2;
-      shade = Math.max(shade, smoothstep(1.15, 0.28, eye));
+      const patchPhi = Math.PI / 2 + EYE_PATCH.theta + (t - EYE_PATCH.t) * EYE_PATCH.tilt;
+      const eye = ((t - EYE_PATCH.t) / EYE_PATCH.ht) ** 2 + ((phi - patchPhi) / EYE_PATCH.hth) ** 2;
+      shade = Math.max(shade, smoothstep(1.0, 0.55, eye));
       colors.push(shade, shade, shade);
     }
   }
@@ -781,23 +803,24 @@ function stampJoints(bag) {
   }
 }
 
+/* Patch and pupil are sampled on the body surface itself, so they wrap the head
+   instead of reading as a flat card from the posed angle. */
 function stampEyes(bag) {
-  const t = 0.2;
-  const x = BODY_X0 + (BODY_X1 - BODY_X0) * t;
-  const y = spline(YC, t) + 0.06;
-  const z = spline(RZ, t) * 0.96;
-  function disc(cx, cy, cz, rx, ry, lift, shade, region, amount) {
-    const side = cz >= 0 ? 1 : -1;
-    for (let i = 0; i < amount; i += 1) {
-      const a = Math.random() * Math.PI * 2;
-      const r = Math.sqrt(Math.random());
-      bagAdd(bag, cx + Math.cos(a) * r * rx, cy + Math.sin(a) * r * ry, cz + side * lift, 0, 0.15, side, shade, region);
+  function patch(tc, thc, ht, hth, tilt, lift, shade, region, amount) {
+    for (const side of [1, -1]) {
+      for (let i = 0; i < amount; i += 1) {
+        const a = Math.random() * Math.PI * 2;
+        const r = Math.sqrt(Math.random());
+        const du = Math.cos(a) * r * ht;
+        const theta = thc + du * tilt + Math.sin(a) * r * hth;
+        const [x, y, z, s, c] = bodyPoint(tc + du, theta, lift);
+        bagAdd(bag, x, y, z * side, 0, s, c * side, shade, region);
+      }
     }
   }
-  for (const side of [1, -1]) {
-    disc(x, y, z * side, 0.1, 0.045, 0.015, 1, 4, Math.round(90 * cloudDensity));
-    disc(x + 0.012, y + 0.004, z * side, 0.022, 0.014, 0.04, 0, 5, Math.round(22 * cloudDensity));
-  }
+  const e = EYE_PATCH;
+  patch(e.t, e.theta, e.ht, e.hth, e.tilt, 0.008, 1, 4, Math.round(340 * cloudDensity));
+  patch(e.t - e.ht * 1.05, e.theta - 0.2, 0.007, 0.06, 0, 0.012, 0, 5, Math.round(22 * cloudDensity));
 }
 
 function packBag(bag) {
